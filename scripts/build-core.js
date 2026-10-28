@@ -51,6 +51,11 @@ const ENTRY = [
   'log', 'setStatus', 'setCaptureVolumeUI', 'render', 'renderPresetSelect', 'renderCaptureIR', 'renderCaptureIRExtraParams',
   'toast', 'showSaveResult', 'renderTunerReading', 'askText', 'askConfirm', 'showNotice', 'chooseSlot',
   'renderExpPanel', 'setExpStatus',
+  // overridden or reached by pro/live-sync.js and pro/ui.js (live pedal sync, auditions, preset moves)
+  'handleTypedMessage', 'parseBufferedCurrentState', 'beginPresetLoad', 'applyFXEnabledStatesFromCurrentState',
+  'applyFXModelsFromCurrentState', 'handleFXParamRefreshResponse', 'requestNextFXParamRefresh', 'cancelFXParamRefresh',
+  'handleCabinetSlotContentResponse', 'normalizedToParamValue', 'normaliseName', 'captureRawToDb', 'blockSlotConfig',
+  'gattWriteQueue', 'gattWritePumpRunning', 'waitUntil', 'encodeInt32',
 ];
 
 // Upstream functions the pro UI replaces on `window`. Must be function declarations.

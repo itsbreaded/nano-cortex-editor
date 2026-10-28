@@ -33,6 +33,7 @@
       <span class="dirty-mark" id="dirtyMark" hidden>Unsaved changes</span>
       <div class="grow"></div>
       <button class="btn ghost" id="tunerBtn" title="Tuner (T)">Tuner</button>
+      <button class="btn ghost" id="muteBtn" title="Mute Guitar Input" aria-label="Mute Guitar Input" aria-pressed="false" disabled>Mute</button>
       <button class="btn ghost" id="metroBtn" title="Metronome (N)">Metronome</button>
       <button class="btn ghost" id="renameBtn" title="Rename this preset on the pedal">Rename</button>
       <button class="btn ghost" id="saveAsBtn" title="Save the current sound into another preset slot (⇧⌘S)">Save as…</button>
@@ -118,7 +119,9 @@
   <div class="toast" id="toast" role="status"></div>
 
   <script src="core.js"></script>
+  <script src="live-sync.js"></script>
   <script src="links.js"></script>
+  <script src="capture-text.js"></script>
   <script src="transfer.js"></script>
   <script src="ui.js"></script>
 </body>

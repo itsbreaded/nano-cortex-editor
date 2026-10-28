@@ -69,6 +69,10 @@ The macOS app is signed by "Anup Sebastian" (Developer ID) and notarised by Appl
 - Bluetooth goes through BlueZ, the standard Linux Bluetooth stack: your adapter has to be on and the `bluetooth`
   service running (see [Troubleshooting](#15-troubleshooting)).
 
+**Updates.** The app checks GitHub for new versions and lets you install one, skip it or be reminded later; turn
+this off in [Settings](#12-settings) → General → Advanced. The portable `.exe` and the deb only link to the download.
+Version 1.0.0 doesn't check, so get the next version from the Releases page once.
+
 **Before you save anything**, back up your presets with the official Cortex Cloud app. Edits from this editor are live
 on the pedal, and saves are permanent.
 
@@ -82,8 +86,16 @@ The editor opens on the connect screen.
    only one Bluetooth connection at a time**; while the phone holds it, the editor cannot see the pedal.
 2. **Make it visible.** After a power-up, hold **EXIT** + **CAPTURE** for about a second, until the Gain ring lights
    up. After a plain disconnect from the editor it stays reachable without this.
-3. **Click Connect.** The app scans for a few seconds and picks your Nano Cortex automatically. If it can't tell which
-   device is the pedal, it shows a list to choose from. No USB cable is needed.
+3. **Click Connect.** The app looks only for devices that offer the Nano Cortex's Bluetooth service and connects to
+   the pedal as soon as it shows up, with or without a name. If that takes more than a moment, a "Looking for your
+   Nano Cortex" window repeats step 2 and keeps scanning. No USB cable is needed.
+
+If the pedal still doesn't appear, click **Show all Bluetooth devices** in that window. It lists every device nearby,
+updated while it scans: names that look like the pedal first, then devices without a name (on Windows the Nano Cortex
+often has none), then everything else. Pick the pedal there. **Scan again** restarts the scan (each one runs about a
+minute). The app remembers a device only after it has found the Nano Cortex's editor service on it, so picking the
+wrong one does no harm: it says "That device isn't a Nano Cortex", marks it, and lets you choose again. A pedal found
+through the full list is remembered with it, and the next Connect starts there.
 
 If the pedal doesn't show up or Bluetooth is off, the message on the connect screen has a **Troubleshooting** link to
 [section 15](#15-troubleshooting). **Read the manual** at the bottom opens this manual in your browser.
@@ -99,6 +111,10 @@ header returns to the connect screen.
 The app then connects to the pedal it used last as soon as it starts, without the list. **Forget pedal** clears the
 remembered pedal.
 
+**Sleep.** Before the computer sleeps the editor disconnects from the pedal, so the pedal is free (and visible to
+Connect) afterwards. When the computer wakes, the editor reconnects to the pedal if it was connected before the sleep
+(whether or not **Reconnect to the last pedal at launch** is on).
+
 ## 3. Tour of the window
 
 ![The whole window in demo mode](images/hero.png)
@@ -108,10 +124,11 @@ remembered pedal.
 
 **Header.**
 
-![The header: logo, preset number and name, then Tuner, Metronome, Rename, Save as…, Refresh, Exit demo and Save](images/header.png)
+![The header: logo, preset number and name, then Tuner, Mute, Metronome, Rename, Save as…, Refresh, Exit demo and Save](images/header.png)
 
-From left to right: the current preset's number and name; **Tuner**; **Metronome**; **Rename**; **Save as…**;
-**Refresh** (re-reads everything from the pedal); **Connect** / **Exit demo**; and **Save**. When you have unsaved
+From left to right: the current preset's number and name; **Tuner**; **Mute** (the pedal's guitar input, see
+[Monitoring](#monitoring); red while muted); **Metronome**; **Rename**; **Save as…**; **Refresh** (re-reads everything
+from the pedal); **Connect** / **Exit demo**; and **Save**. When you have unsaved
 edits, an orange **Unsaved changes** label appears, **Save** lights up and an outlined **Discard** button appears:
 
 ![The header with unsaved edits: an orange Unsaved changes label, a Discard button and a highlighted Save button](images/header-dirty.png)
@@ -140,7 +157,7 @@ message sent and the **Record** and **Activity** buttons.
 ![The status bar: demo-mode indicator and the Settings, Shortcuts and Support buttons](images/status-bar.png)
 
 **Help menu**: **Manual** (this page), **GitHub Repository**, **Report an Issue**, **Show Log File** (see
-[Troubleshooting](#15-troubleshooting)) and **Support the Project…**. The links open in your default browser.
+[Troubleshooting](#15-troubleshooting)), **Check for Updates…** and **Support the Project…**. The links open in your default browser.
 
 ## 4. Presets
 
@@ -180,6 +197,19 @@ want it back.
 the pedal, after you confirm.
 
 ![The Discard confirmation](images/discard.png)
+
+**Reordering.** Drag a preset onto another row to move it there; the presets in between shift by one place (an
+insert, not a swap). The row under the mouse shows a ⋮⋮ grip at its right end as a hint; you can drag by it or by
+any other part of the row. Escape cancels a drag, and holding it near the top or bottom of the list scrolls the list.
+It works with the filter on, too. With unsaved edits the editor asks first, as for a switch. After
+the move it reads the preset list and the current preset back from the pedal, so what you see is the pedal's order. If
+that read fails, the header shows **Preset ?** and Save, Save as, Rename and Discard stay off until a read succeeds
+(**Refresh**, or pick a preset). Check your footswitch assignments after moving presets. Reordering is off while a
+slot usage scan (**Usage…** in the Capture inspector) runs.
+
+**Changes on the pedal itself** show up as you make them: turning a knob, switching an effect with a footswitch, or
+moving the expression pedal updates the knobs and lights in the editor. Effect amounts the expression pedal controls
+are read back from the pedal while it moves.
 
 ## 5. Editing blocks
 
@@ -234,6 +264,8 @@ Right-click a slot for **Load**, **Put a library capture in slot N…** and **In
 
 **Info…** asks the pedal for the capture's details: author, kind and instrument, tags and description. With
 [Developer tools](#developer-tools) on it also shows the capture's hash (**Copy** puts the full hash on the clipboard).
+Some captures carry only their Cortex Cloud ID as the description; for those, Info shows **Open in Cortex Cloud**
+instead, which opens the capture's page in the Cortex Cloud tab.
 
 ![Capture info: Capture 1C, JP2C Ch3 by Neural DSP, combo and guitar icons, tags and description](images/capture-info.png)
 
@@ -241,10 +273,18 @@ When a preset plays a capture straight from the library rather than from a slot,
 "From the library: *name*".
 
 **Cab / IR.** **Level**, **High pass** and **Low pass**, then the **Microphone** (mic and position, for factory cabs),
-then the **Cabs and IRs on the pedal**: five slots, with **Load from library…** as for captures. The microphone and
-position are stored in the cab slot, so changing them affects every preset that uses that slot.
+then the **Cabs and IRs on the pedal**: five slots. The microphone and position are stored in the cab slot, so
+changing them affects every preset that uses that slot.
 
-![The Cab / IR inspector: tone knobs, mic choices and positions 1–6, and the five cab slots](images/inspector-cab.png)
+**From the library** lists the pedal's factory cabs and your IRs, with a search box. Click an item to choose a slot
+for it. Its **▶** button auditions it: the pedal plays that IR without loading it into a slot (the row lights up and
+the button turns into **■**, which stops it). While an IR is auditioned the microphone and position are locked.
+Quitting the app stops the audition first.
+Right-click an item for **Preview** and **Load into slot…**; your own IRs also have **Delete…**, which removes the IR
+from the pedal after you confirm (there is no undo; the dialog says if one of the five slots holds that IR).
+
+
+![The Cab / IR inspector: tone knobs, mic choices and positions 1–6, the five cab slots, and From the library with a search box, factory cabs and your IRs, each with a ▶ button](images/inspector-cab.png)
 
 ## 6. Footswitches
 
@@ -306,7 +346,8 @@ Press **T** or click **Tuner** in the header.
 
 The tuner shows the note and how many cents sharp or flat you are; the needle centres when you are in tune. The pedal
 only reports pitch while a string is sounding. Set the **Reference** (400–480 Hz, default 440) and click **Mute** to
-silence the pedal's output while you tune. **Esc** or **Close** ends the tuner.
+silence the pedal's output while you tune. **Esc** or **Close** ends the tuner. If the guitar input was muted
+(header **Mute**) when you opened the tuner, it is muted again when the tuner closes.
 
 ## 10. Metronome
 
@@ -339,6 +380,10 @@ for microphone permission; that is only how browsers reveal output names. Nothin
 
 ![The Levels popover with Accent, Main ticks and Subdivisions sliders](images/metronome-levels.png)
 
+**Your own sounds** ([Settings](#12-settings) → Metronome → Sounds): the accent, the main beat and the subdivisions
+can each play a built-in sound or **Custom sample…**, a WAV, AIFF, MP3, M4A/AAC, FLAC or Ogg file up to 5 MB, played
+in mono and cut to its first 2 seconds. The app keeps its own copy of the file; **Reset** goes back to the built-in sound.
+
 **Follow the preset tempo** ([Settings](#12-settings) → Metronome): when on and connected, the metronome plays the
 current preset's tempo and follows preset changes, and changing the metronome's tempo writes it to the preset (Save
 keeps it). The panel then says "♩ follows preset".
@@ -355,7 +400,7 @@ The **Cortex Cloud** tab (⌘2) shows Neural DSP's own Cortex Cloud website insi
 **Sending a capture to the pedal.** Open a capture's page on the site (for example from Discover → Neural Captures).
 **Send to Nano Cortex** in the toolbar lights up:
 
-![Our toolbar on the Cortex Cloud tab: Editor and Cortex Cloud tabs, back, forward, reload, Home and the highlighted Send to Nano Cortex button](images/cloud-toolbar.png)
+![Our toolbar on the Cortex Cloud tab: Editor and Cortex Cloud tabs, back, forward, reload, Home, IRs, the highlighted Send to Nano Cortex and Live Preview buttons, the IR: Off indicator and Sign out](images/cloud-toolbar.png)
 
 Click it. The app fetches the capture with your Cortex Cloud login and switches to the Editor, which asks you to
 confirm:
@@ -366,7 +411,21 @@ confirm:
 preset changes. The editor then offers to load it into a slot right away (**Choose a slot**) or **Later** (it is in
 **Load from library…** whenever you want it). The pedal must be connected; the phone app must not be.
 
-Only captures can be sent for now; preset pages and IRs from Cortex Cloud still go through the official app.
+**Live Preview.** On a capture's page, **Live Preview** plays the capture on the pedal without storing it anywhere:
+no slot or library item changes. **Stop Preview** ends it. **IR: On / Off** next to it switches the cab / IR of the
+current preset, to hear the capture with or without it. A preview keeps running while you browse; anything that saves
+or changes the preset (Save, switching presets, Discard, Rename, …) stops it first, and if the pedal doesn't confirm
+the stop, that action doesn't happen. Quitting the app stops it too (it waits at most a second and a half for the
+pedal). After a stop the editor reads the preset again, so the chain shows the preset's own capture.
+
+**Sending an IR to the pedal.** Open your profile's **Impulse Responses** list (**IRs** in the toolbar). The app adds
+**Send to Nano** beside each IR. Click it, confirm in the Editor, and the app sends the WAV to the pedal's IR library
+over Bluetooth. It does not change a preset slot. After the pedal accepts the IR, the editor reads the library again,
+so it appears under **From the library**. An IR that is already on the pedal (same name) isn't sent again. Only WAV
+files up to 1 MB in PCM or float format, mono or stereo, are sent. The pedal must be connected; preset downloads from
+Cortex Cloud still go through the official app.
+
+Only one transfer to the pedal runs at a time (a capture, an IR or a preview); the others wait their turn.
 
 ## 12. Settings
 
@@ -378,11 +437,13 @@ Open Settings with ⌘, (Ctrl+, on Windows), from the app menu, or with **Settin
 
 - **Appearance**: seven accent colours for highlights, buttons and the app icon. **Dock icon follows the accent**
   recolours the app icon too.
-- **Metronome**: click sound (Click, Woodblock, Tick, Beep, Cowbell) with **Preview**, output, volume, default tempo,
-  **Follow the preset tempo**, beats per bar, which mode the panel **Opens in**, and the Advanced defaults (pattern,
-  subdivision, count-in and the three levels).
+- **Metronome**: output, volume, default tempo, **Follow the preset tempo**, beats per bar, which mode the panel
+  **Opens in**, the Advanced defaults (pattern, subdivision, count-in and the three levels), and **Sounds**: for the
+  accent, the main beat and the subdivisions, a built-in sound (Click, Woodblock, Tick, Beep, Cowbell) or your own
+  sample ([section 10](#10-metronome)), with ▶ to hear it.
 - **Connection**: **Reconnect to the last pedal at launch** and **Forget pedal**.
-- **Advanced**: **Developer tools** (below). With it on, also **Show the Activity drawer at launch** and **Show
+- **Advanced**: **Check for updates automatically** (on by default; see Updates in
+  [section 1](#1-install-and-first-launch)) and **Developer tools** (below). With it on, also **Show the Activity drawer at launch** and **Show
   recordings folder**.
 
 <a id="developer-tools"></a>
@@ -402,11 +463,14 @@ closes the Activity drawer. The log file (**Help → Show Log File**) is written
 
 **Device** reads the pedal's own settings each time you open it.
 
-![Settings, Device tab: name, firmware and serial, LED brightness and USB playback volume](images/settings-device.png)
+![Settings, Device tab: name, firmware and serial, LED brightness and USB playback volume, and Monitoring with the Mute Input and Mute Outputs 1L/2R switches](images/settings-device.png)
 
 - **About**: the pedal's name, firmware and serial number (and, with Developer tools on, the device hash).
 - **LED brightness** (the manual's default is 60 %) and **USB playback volume** (audio from the computer over USB,
   default −6.0 dB). These are global settings: they apply on the pedal right away, not per preset.
+- <a id="monitoring"></a>**Monitoring**: **Mute Input** mutes the guitar input (USB audio still plays) and **Mute
+  Outputs 1L/2R** mutes the processed sound at the outputs. Also global, and nothing to save. The header's **Mute**
+  button is the same switch as **Mute Input**.
 - **Raw settings** (Developer tools only) lists the other values the pedal reports, read-only.
 - **Read again** refreshes everything.
 
@@ -462,12 +526,21 @@ manual. On Windows and Linux the keys are Ctrl for ⌘ and Shift for ⇧ (the in
 
 ## 15. Troubleshooting
 
-**"No Nano Cortex showed up nearby."**
+**The pedal doesn't show up ("Looking for your Nano Cortex" finds nothing).**
 - Make sure the pedal is on and the Cortex Cloud phone app is **not** connected to it (quit the app or turn off the
   phone's Bluetooth). The pedal takes one connection at a time.
-- After a power-up, hold **EXIT** + **CAPTURE** for a second until the Gain ring lights up, then click **Connect**
-  again. The first scan after the pedal boots can come up empty; try once more.
+- After a power-up, hold **EXIT** + **CAPTURE** for a second until the Gain ring lights up. The window keeps scanning;
+  once the scan has finished, click **Scan again**. The first scan after the pedal boots can come up empty.
+- Still nothing: click **Show all Bluetooth devices** and look near the top of the list, including **Unnamed device**
+  rows ([section 2](#2-connecting)).
 - Move closer; Bluetooth LE range drops behind walls and racks.
+
+**The list shows other devices (speakers, headsets) but not the pedal, or "That device isn't a Nano Cortex".**
+- Put the pedal in pairing mode as above and wait a few seconds: the list updates while it scans. On Windows the Nano
+  Cortex often appears as **Unnamed device**; those are listed right after pedal-like names.
+- A device you picked that turned out not to be the pedal is marked **Not a Nano Cortex** and moved to the bottom. The
+  app never remembers it. Version 1.0.0 could remember such a device and then try it on every Connect; the first
+  failed attempt now forgets it and shows the list again. **Settings → Connection → Forget pedal** does the same by hand.
 
 **"The pedal dropped the connection."** Usually the phone app grabbed it. Close it and connect again.
 
@@ -529,9 +602,9 @@ first, and report anything odd.
 work but are untested.
 
 **Does the app see my Cortex Cloud password?** No. You sign in on the website's own page; the app only uses the
-resulting session to download a capture when you click **Send to Nano Cortex**.
+resulting session to fetch a capture or IR after you click a **Send to Nano** button.
 
-**Can I send IRs or presets from Cortex Cloud?** Not yet; only captures. Use the official app for those.
+**Can I send presets from Cortex Cloud?** Not yet. Use the official app for presets.
 
 **Is there a Mac-native version?** Yes:
 [Nano Cortex Editor for Mac](https://github.com/AJs-Creations/nano-cortex-editor-mac), with the same features.

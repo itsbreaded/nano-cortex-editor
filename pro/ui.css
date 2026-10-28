@@ -131,9 +131,9 @@ button, input, select { font: inherit; color: inherit; }
 ::-webkit-scrollbar-thumb:hover { background: #525252; background-clip: padding-box; }
 ::-webkit-scrollbar-corner { background: transparent; }
 .preset-row {
-  display: grid; grid-template-columns: 26px 1fr; align-items: center;
+  display: grid; grid-template-columns: 26px 1fr 12px; align-items: center;
   height: 28px; padding: 0 8px; border-radius: var(--r-sm);
-  cursor: pointer; color: var(--dim);
+  cursor: default; color: var(--dim);
 }
 .preset-row .n { color: var(--faint); font-size: 11px; }
 .preset-row .t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -141,6 +141,25 @@ button, input, select { font: inherit; color: inherit; }
 .preset-row.active { background: color-mix(in srgb, var(--accent) 24%, var(--panel)); color: #fff; box-shadow: inset 2px 0 0 var(--accent); }   /* #2a2456 for purple */
 .preset-row.active .n { color: color-mix(in srgb, var(--accent) 47%, #fff); }   /* #b9afff for purple */
 .preset-row.empty .t { color: var(--faint); font-style: italic; }
+/* Reorder grip: ⋮⋮ (2 × 3 dots of 2 px, 6 × 10) at the row's right end, its right edge 8 px in, faint; only on the row
+   under the mouse. Its target is 20 × 28 (the last column plus the row's right padding); the open hand only there, the
+   closed hand for the whole drag (pointer events, so the page keeps the cursor). The third column is always reserved,
+   so names don't shift when the grip appears. The native edition draws the same (PresetReorder.swift). */
+.preset-row .grip {
+  grid-column: 3; display: flex; align-items: center; justify-content: flex-end;
+  height: 28px; margin-right: -8px; padding-right: 8px;
+  color: var(--faint); cursor: grab; visibility: hidden;
+}
+.preset-row .grip svg { display: block; width: 6px; height: 10px; }
+html:not(.preset-dragging) .preset-row.reorderable:hover .grip { visibility: visible; }
+.preset-row .grip:hover { color: var(--dim); }
+html.preset-dragging, html.preset-dragging * { cursor: grabbing !important; }
+.preset-ghost { position: fixed; z-index: 60; pointer-events: none; opacity: .85; }
+.preset-ghost .preset-row { background: var(--raised); color: var(--text); box-shadow: 0 6px 16px #0008; }
+.preset-row.dragging { opacity: .45; }
+.preset-row.drop-target { box-shadow: inset 0 0 0 1px var(--focus); }
+.preset-row.reorder-pending { opacity: .7; cursor: progress; }
+.preset-list[aria-busy="true"] { cursor: progress; }
 .side-empty { padding: 16px 12px; color: var(--faint); }
 /* footswitches strip (4-Preset mode slots), under the preset list */
 .fs-strip { flex: none; padding: 10px 12px 12px; border-top: 1px solid var(--line); }
@@ -391,6 +410,37 @@ button, input, select { font: inherit; color: inherit; }
 .slot.on { border-color: var(--c); color: var(--text); background: #2e2e2e; }
 .slot.on .n { color: var(--c); }
 .slots.disabled { opacity: .4; pointer-events: none; }
+.slots.loading { opacity: .78; }
+.slot.ir-loading { border-color: var(--focus); color: var(--text); }
+.slot-load-pending { color: var(--focus); font-size: 18px; line-height: 1; animation: pulse 1s infinite; }
+.ir-load-status { color: var(--text) !important; }
+.slot.preview-muted { opacity: .38; border-color: var(--line-soft); background: var(--raised); color: var(--dim); }
+.slot.preview-muted .n { color: var(--faint); }
+
+/* Compact library tiles in the Cab / IR inspector. Their grid and height match the pedal slots. */
+.section-divider { display: flex; align-items: center; gap: 12px; margin: 25px 0 8px; }
+.section-divider::before, .section-divider::after { content: ""; height: 1px; flex: 1; background: var(--line-soft); }
+.section-divider h3 { margin: 0; white-space: nowrap; }
+.library-hint { color: var(--faint); font-size: 12px; margin: 0 0 10px; }
+.cab-library-search { width: 100%; max-width: 1100px; margin: 0 0 10px; }
+.cab-library-groups { display: grid; gap: 12px; max-width: 1100px; }
+.cab-library-group { min-width: 0; }
+.cab-library-group h4 { margin: 0 0 6px; color: var(--faint); font-size: 10px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; }
+.library-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 6px; }
+.library-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 5px; min-width: 0; height: 34px; padding: 0 4px 0 9px; border: 1px solid var(--line-soft); border-radius: var(--r-sm); background: var(--raised); transition: background .12s, border-color .12s; }
+.library-row:hover { background: var(--raised-hi); border-color: #3a3a3a; }
+.library-row.previewing { border-color: var(--focus); background: color-mix(in srgb, var(--accent) 15%, var(--raised)); box-shadow: inset 2px 0 var(--focus); }
+.library-item { min-width: 0; overflow: hidden; padding: 0; border: 0; background: transparent; color: var(--dim); font: inherit; text-align: left; cursor: pointer; }
+.library-item span { display: -webkit-box; overflow: hidden; color: inherit; font-size: inherit; font-weight: inherit; line-height: 1.15; overflow-wrap: anywhere; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.library-row:hover .library-item span { color: var(--text); }
+.library-row.previewing .library-item span { color: var(--text); }
+.library-preview { display: inline-flex; align-items: center; justify-content: center; width: 26px; min-width: 26px; height: 26px; padding: 0; border: 1px solid #414141; border-radius: 4px; background: #242424; color: #ddd; cursor: pointer; }
+.library-preview-icon { display: block; width: 12px; height: 12px; }
+.library-preview-pending { font-size: 15px; line-height: 1; }
+.library-preview:hover { border-color: #777; background: #2c2c2c; }
+.library-preview.playing { border-color: var(--accent-hi); background: color-mix(in srgb, var(--accent) 20%, var(--raised)); color: #e1dcff; }
+.library-preview:disabled, .library-item:disabled { opacity: .5; cursor: default; }
+.library-empty { margin: 12px 0 0; color: var(--faint); font-size: 12px; }
 
 /* ---------- disconnected overlay ---------- */
 .veil {
@@ -515,7 +565,7 @@ body:not(.dev-tools) .dev-only { display: none !important; }
 /* phone-width: keep the header to one row */
 @media (max-width: 600px) {
   .head { gap: 6px; padding: 0 10px; }
-  #refreshBtn, #renameBtn, #saveAsBtn, #tunerBtn, #metroBtn, .btn kbd, .dirty-mark, .preset-title .num, #keysBtn, #supportBtn { display: none; }
+  #refreshBtn, #renameBtn, #saveAsBtn, #tunerBtn, #muteBtn, #metroBtn, .btn kbd, .dirty-mark, .preset-title .num, #keysBtn, #supportBtn { display: none; }
   .btn { padding: 0 10px; }
   .status .grow, #pcText { display: none; }
   .status { justify-content: space-between; }
@@ -552,6 +602,8 @@ body:not(.dev-tools) .dev-only { display: none !important; }
 .status #recBtn.on { color: var(--danger); font-weight: 600; }
 
 .head .btn.on { color: var(--text); border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.head .btn.mute-active { background: var(--danger); border-color: var(--danger); color: #fff; }
+.head .btn.mute-active:hover { background: #c93b4e; border-color: #c93b4e; }
 
 /* ---- metronome (layout in step with the native overlay: 8 px rhythm, one 30 px control height) */
 .metro .tuner-card { width: min(520px, calc(100% - 32px)); padding: 20px 24px 18px; max-height: calc(100vh - 32px); overflow-y: auto; text-align: left; }
@@ -692,9 +744,9 @@ body:not(.dev-tools) .dev-only { display: none !important; }
 
 /* ---------- context menu ---------- */
 .ctx-bg { position: fixed; inset: 0; z-index: 35; }
-.ctx { position: fixed; min-width: 220px; padding: 5px; background: #262a31; border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 14px 34px #000b; display: flex; flex-direction: column; }
+.ctx { position: absolute; min-width: min(220px, var(--ctx-max-width, calc(100vw - 16px))); max-width: var(--ctx-max-width, calc(100vw - 16px)); max-height: var(--ctx-max-height, calc(100vh - 16px)); padding: 5px; overflow-y: auto; overflow-x: hidden; background: #262a31; border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 14px 34px #000b; display: flex; flex-direction: column; }
 .ctx .sep { height: 1px; margin: 4px 6px; background: var(--line); }
-.ctx-item { display: flex; align-items: center; height: 28px; padding: 0 10px; border: 0; background: none; color: var(--text); text-align: left; border-radius: var(--r-sm); cursor: pointer; white-space: nowrap; }
+.ctx-item { display: flex; align-items: center; min-height: 28px; height: auto; max-width: 100%; padding: 5px 10px; border: 0; background: none; color: var(--text); text-align: left; border-radius: var(--r-sm); cursor: pointer; white-space: normal; overflow-wrap: anywhere; }
 .ctx-item:hover, .ctx-item:focus-visible { background: var(--accent); color: var(--on-accent); outline: none; }
 .ctx-item:disabled { color: var(--faint); cursor: default; background: none; }
 .ctx-item.danger { color: var(--danger); }
@@ -730,6 +782,11 @@ body:not(.dev-tools) .dev-only { display: none !important; }
 .set-ctl input[type=range] { width: 200px; }
 .set-unit { color: var(--faint); font-size: 12px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .modal .set-note, .set-note { margin: 0; color: var(--faint); font-size: 12px; flex: 1 1 260px; }
+.settings h4.set-sub { margin: 10px 0 2px; font-size: 12px; font-weight: 600; color: var(--dim); }
+.set-ctl .snd-play { display: inline-grid; place-items: center; width: 28px; height: 28px; padding: 0; }
+.set-ctl .snd-file { max-width: 200px; }
+.settings .snd-msg { margin: 4px 0 0 142px; color: var(--warn); }
+@media (max-width: 600px) { .settings .snd-msg { margin-left: 0; } }
 .swatches { display: flex; gap: 10px; flex-wrap: wrap; }
 .swatch { width: 26px; height: 26px; border-radius: 50%; border: 0; padding: 0; background: var(--sw); cursor: pointer; box-shadow: inset 0 0 0 1px #ffffff22; }
 .swatch:hover { transform: scale(1.08); }
@@ -762,6 +819,9 @@ body:not(.dev-tools) .dev-only { display: none !important; }
 .chips { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
 .chip { padding: 1px 9px; border-radius: 10px; background: var(--raised); border: 1px solid var(--line); color: var(--dim); font-size: 12px; line-height: 18px; }
 .cap-desc { margin: 0 0 10px; color: var(--dim); font-size: 12px; line-height: 1.45; }
+/* "Open in Cortex Cloud" (a capture whose description is its Cloud ID): a link-style ghost button where the description
+   would be, its text lined up with the text above. */
+.cap-cloud { display: flex; width: fit-content; margin: -4px 0 4px -10px; }
 .cap-hash { display: flex; align-items: center; gap: 8px; padding-top: 8px; border-top: 1px solid var(--line-soft); font-size: 12px; }
 .cap-hash .k { color: var(--faint); }
 .cap-hash .v { color: var(--dim); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; user-select: text; }
@@ -782,3 +842,32 @@ body:not(.dev-tools) .dev-only { display: none !important; }
 .about-name { font-size: 16px; font-weight: 600; margin: 0 0 6px; }
 .about-ver { color: var(--dim); font-weight: 400; }
 .about-links { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+
+/* ---- Bluetooth chooser (desktop app): every device seen, live, scrollable (src/bt-picker.js sorts them) */
+.modal.bt-chooser { width: min(500px, calc(100% - 32px)); max-height: calc(100vh - 48px); display: flex; flex-direction: column; }
+.bt-chooser p.bt-hint { margin: 0 0 12px; font-size: 12.5px; }
+.bt-chooser p.bt-hint kbd { font: inherit; font-size: 11px; color: var(--text); background: var(--raised); border: 1px solid var(--line); border-radius: 4px; padding: 0 5px; }
+.bt-chooser p.bt-notice { margin: 0 0 10px; }
+.bt-chooser p.bt-notice:empty { display: none; }
+.bt-status { display: flex; align-items: center; gap: 8px; margin: 0 0 8px; color: var(--dim); font-size: 12px; }
+.bt-list { flex: 1 1 auto; min-height: 96px; max-height: 300px; overflow-y: auto; margin: 0 0 16px; padding: 4px; background: var(--ws); border: 1px solid var(--line); border-radius: var(--r-md); }
+.bt-row { display: flex; align-items: center; gap: 10px; width: 100%; min-height: 34px; padding: 6px 10px; background: none; border: 0; border-radius: var(--r-sm); color: var(--text); font: inherit; text-align: left; cursor: pointer; }
+.bt-row:hover, .bt-row:focus-visible { background: #33405a; outline: none; }
+.bt-row .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bt-row.unnamed .name { color: var(--dim); }
+.bt-row .tag { flex: none; padding: 1px 7px; border-radius: 4px; background: var(--raised); color: var(--dim); font-size: 11px; white-space: nowrap; }
+.bt-row.nano .tag { background: var(--accent); color: var(--on-accent); }
+.bt-row.not-nano .name, .bt-row.not-nano .tag { color: var(--faint); background: none; }
+.bt-empty { padding: 22px 12px; color: var(--faint); text-align: center; font-size: 12.5px; }
+.bt-chooser .row .grow { flex: 1; }
+/* ---- update modal (desktop app; src/updates.js) */
+.modal.upd-modal { width: min(460px, calc(100% - 32px)); }
+.upd-modal p.upd-notes { max-height: 168px; overflow-y: auto; margin: 0 0 8px; white-space: pre-line; font-size: 12.5px; }
+.upd-modal p.upd-more { margin: 0 0 18px; font-size: 12.5px; }
+.upd-progress { display: flex; align-items: center; gap: 10px; margin: 0 0 18px; }
+.upd-progress[hidden] { display: none; }
+.upd-bar { flex: 1; height: 6px; border-radius: 3px; background: var(--raised); overflow: hidden; }
+.upd-bar > span { display: block; height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+.upd-pct { color: var(--dim); font-size: 12px; white-space: nowrap; min-width: 112px; text-align: right; }
+.upd-modal .row:empty { display: none; }
+.upd-modal .upd-progress:has(+ .row:empty) { margin-bottom: 0; }

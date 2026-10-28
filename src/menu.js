@@ -1,7 +1,7 @@
 // The application menu as a template (no Electron in here, so the UX test can check it). With Developer tools off
 // (Settings → General → Advanced) View has no Classic Editor, Reload Current or Developer Tools; Help → Show Log File
 // is there for everyone.
-//   a: { show(tab), toggleClassic(), reload(), toggleDevTools(), openSettings(), openLink(key), showLogFile() }
+//   a: { show(tab), toggleClassic(), reload(), toggleDevTools(), openSettings(), openLink(key), showLogFile(), checkForUpdates() }
 function menuTemplate({ isMac, appName, devTools, editorFlavor, links, a }) {
   const settingsItem = { label: 'Settings…', accelerator: 'CmdOrCtrl+,', enabled: editorFlavor === 'pro', click: a.openSettings };
   const devItems = devTools ? [
@@ -46,6 +46,7 @@ function menuTemplate({ isMac, appName, devTools, editorFlavor, links, a }) {
         { label: 'Report an Issue', click: () => a.openLink(links.issues) },
         { label: 'Show Log File', click: a.showLogFile },
         { type: 'separator' },
+        { label: 'Check for Updates…', click: a.checkForUpdates },
         { label: 'Support the Project…', click: () => a.openLink(links.support) },
       ],
     },

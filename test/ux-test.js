@@ -188,6 +188,11 @@ async function reloadPage() {
   wc.reload();
   await loaded; await waitFor('typeof __ui !== "undefined" && __ui.demo && state.connected'); await settle(); await frame();
 }
+// A typed frame as the Activity log prints it: [len] C0 [payload] [u32 LE type].
+const hexBytes = (bytes) => bytes.map(b => b.toString(16).toUpperCase().padStart(2, '0')).join(' ');
+const frameHex = (payload, type) => { const f = [0, 0xC0, ...payload, type & 255, (type >> 8) & 255, 0, 0]; f[0] = f.length - 2; return hexBytes(f); };
+const utf8 = (text) => [...Buffer.from(text, 'utf8')];
+const toastText = () => js('document.getElementById("toast").textContent');
 // Computed colours come back as rgb(…) or, for color-mix(), as color(srgb r g b) in 0..1.
 const rgbOf = (css) => {
   let m = /^rgba?\(([\d.]+),\s*([\d.]+),\s*([\d.]+)/.exec(css || '');
@@ -215,6 +220,11 @@ async function run() {
   check('64 presets listed', (await js('document.querySelectorAll(".preset-row").length')) === 64);
   check('active preset row highlighted', (await js('document.querySelector(".preset-row.active .t").textContent')) === 'JP2C Lead');
   check('default inspector is Capture', (await js('document.querySelector(".insp-head h1").textContent')) === 'Capture');
+  // Effect slots take their category's colour; Reverb is soft pink, so a delay next to a reverb no longer looks the same.
+  const nodeColour = (k) => js(`(() => { const n = document.querySelector('[data-fk="node-${k}"]'); return n ? [n.style.getPropertyValue('--c').trim().toLowerCase(), getComputedStyle(n.querySelector('.stage')).color, n.querySelector('.model').textContent] : null; })()`);
+  const delayNode = await nodeColour('post2'), reverbNode = await nodeColour('post3');
+  check('a reverb\'s chain node is soft pink (#f570d6), the delay next to it stays #00ffdd', reverbNode && reverbNode[0] === '#f570d6' && reverbNode[1] === 'rgb(245, 112, 214)' && delayNode && delayNode[0] === '#00ffdd' && delayNode[1] === 'rgb(0, 255, 221)', JSON.stringify([delayNode, reverbNode]));
+  check('every reverb model takes the reverb colour (the category map, not a model list)', await js(`state.blocks.post3.models.filter(m => m.category === 'Reverb').length > 3 && (() => { const b = state.blocks.post3, was = b.model; const ok = b.models.filter(m => m.category === 'Reverb').every(m => { b.model = m.name; return __stageColor('post3') === '#f570d6'; }); b.model = was; return ok; })()`));
   await shot('01-capture');
 
   // ---------------------------------------------------------------- developer tools: off by default
@@ -546,12 +556,33 @@ async function run() {
     Object.assign(state.blocks.pre1, ${pre1BeforeExpression});
     Object.assign(state.exp, ${expBeforeExpression});
     state.connected = true;
-    if (state.expressionParamRefreshTimer) clearTimeout(state.expressionParamRefreshTimer);
-    state.expressionParamRefreshTimer = null;
-    state.expressionPedalRaw = null;
+    NanoLive.reset();
     render();
   })()`);
   await frame();
+  // Only assigned FX blocks are read back while the pedal moves, and an Amount only moves on screen when its
+  // parameter is known (Mix, Amount, Transpose → Semitones); otherwise the read-back shows the real value.
+  const expSaved2 = await js('JSON.stringify({ loaded: state.exp.loaded, preset: state.exp.preset, ranges: state.exp.ranges, bypass: state.exp.bypass })');
+  const pre2Saved = await js('JSON.stringify({ model: state.blocks.pre2.model, on: state.blocks.pre2.on, params: state.blocks.pre2.params })');
+  await js('state.exp.loaded = true; state.exp.preset = state.selectedPreset; state.exp.pending = null; state.exp.ranges = {}; state.exp.bypass = {}; 0');
+  check('with nothing assigned to the expression pedal there is nothing to read back', JSON.stringify(await js('NanoLive.expressionReadbackKeys()')) === '[]');
+  n0 = await mark();
+  await rxExpressionPosition(200); await settle();
+  check('… so a pedal move sends no parameter reads', !(await txSince(n0)).some(t => /param refresh/.test(t)), JSON.stringify(await txSince(n0)));
+  const vague = await js(`(() => {
+    const b = state.blocks.pre2;
+    const m = b.models.find(x => x.name !== 'None' && x.params && x.params.length && !x.params.some(p => /^(mix|amount)$/i.test(p.name)));
+    b.model = m.name; b.params = structuredClone(m.params); b.on = true;
+    state.exp.ranges = { pre2: { on: true, inverted: false, min: 0, max: 100 } };
+    render();
+    return { model: m.name, values: JSON.stringify(b.params.map(p => p.value)) };
+  })()`);
+  n0 = await mark();
+  await rxExpressionPosition(255);
+  tx = await txWait(n0, t => t.some(x => /^TX Pre FX 2 param refresh/.test(x)));
+  check('an effect whose Amount parameter isn\'t known (' + vague.model + ') is not animated but read back', (await js('JSON.stringify(state.blocks.pre2.params.map(p => p.value))')) === vague.values && JSON.stringify(await js('NanoLive.expressionReadbackKeys()')) === '["pre2"]' && tx.some(t => /^TX Pre FX 2 param refresh/.test(t)), JSON.stringify(tx));
+  await js(`(() => { Object.assign(state.exp, ${expSaved2}); Object.assign(state.blocks.pre2, ${pre2Saved}); NanoLive.reset(); render(); })()`);
+  await settle();
 
   // type exact value
   await click('[data-fk="cap-vol"] .val');
@@ -1034,6 +1065,36 @@ async function run() {
   await checkSoon('Close button ends the tuner and the Tuner button un-lights', '!state.tuner.open && !document.getElementById("tunerBtn").classList.contains("on")');
   await settle();
 
+  // ---------------------------------------------------------------- header Mute and the tuner's mute re-arm
+  // Mute Input is a global setting (67 {1:1 12:0|1}, read back as 66 field 15). The pedal still reports it on after the
+  // tuner closes but needs a fresh off → on to mute again, so closing the tuner sends both (after the tuner-off write).
+  const MUTE_IN = (on) => frameHex([0x08, 0x01, 0x60, on ? 1 : 0], 67);
+  await checkSoon('the header Mute button is ready once the device settings are read at connect', '!document.getElementById("muteBtn").disabled && document.getElementById("muteBtn").getAttribute("aria-pressed") === "false"');
+  n0 = await mark();
+  await click('#muteBtn');
+  tx = await txWait(n0, t => t.some(x => x.endsWith(': ' + MUTE_IN(true))));
+  tx = tx.filter(x => /Mute Input/.test(x));
+  check('header Mute sends Mute Input on, exactly 67 {1:1 12:1}', tx.length === 1 && tx[0] === 'TX Device monitoring: Mute Input ON: ' + MUTE_IN(true), JSON.stringify(tx));
+  await checkSoon('… and turns red, pressed (read back from 66 field 15)', 'document.getElementById("muteBtn").classList.contains("mute-active") && document.getElementById("muteBtn").getAttribute("aria-pressed") === "true" && __dev.settings.muteInput === true');
+  await click('#tunerBtn');
+  await checkSoon('the tuner opens while the input is muted', 'state.tuner.open');
+  n0 = await mark();
+  await click('#tunerClose');
+  tx = (await txWait(n0, t => t.filter(x => /^TX (Tuner off|Device monitoring: Mute Input)/.test(x)).length >= 3)).filter(x => /^TX (Tuner off|Device monitoring: Mute Input)/.test(x)).map(x => x.split(': ').pop());
+  check('closing the tuner re-arms the mute: Tuner off, then Mute Input off and on again', JSON.stringify(tx) === JSON.stringify([frameHex([0x20, 0x00], 127), MUTE_IN(false), MUTE_IN(true)]), JSON.stringify(tx));
+  await checkSoon('the mute is still on afterwards', '__dev.settings.muteInput === true && document.getElementById("muteBtn").classList.contains("mute-active")');
+  n0 = await mark();
+  await click('#muteBtn');
+  tx = await txWait(n0, t => t.some(x => x.endsWith(': ' + MUTE_IN(false))));
+  tx = tx.filter(x => /Mute Input/.test(x));
+  check('header Mute again sends Mute Input off (an explicit 0)', tx.length === 1 && tx[0].endsWith(': ' + MUTE_IN(false)), JSON.stringify(tx));
+  await checkSoon('… and the button is back to normal', '!document.getElementById("muteBtn").classList.contains("mute-active") && __dev.settings.muteInput === false');
+  await click('#tunerBtn'); await checkSoon('tuner up again, input not muted', 'state.tuner.open');
+  n0 = await mark();
+  await click('#tunerClose'); await waitFor('!state.tuner.open');
+  await settle({ quiet: 600 });
+  check('without the mute, closing the tuner sends only Tuner off', JSON.stringify((await txSince(n0)).map(x => x.split(': ')[0])) === JSON.stringify(['TX Tuner off']), JSON.stringify(await txSince(n0)));
+
   // ---------------------------------------------------------------- metronome
   await js('document.activeElement.blur()');
   await key('n');
@@ -1329,6 +1390,7 @@ async function run() {
   check('kind icons are inline 14 px line drawings', await js(`(() => { const s = ${rowOf('Plexi 1959 SLP')}.querySelector(".sub .kind svg"); const r = s.getBoundingClientRect(); return s.getAttribute("viewBox") === "0 0 16 16" && s.getAttribute("fill") === "none" && Math.round(r.width) === 14 && Math.round(r.height) === 14; })()`));
   check('combo, pedal, preamp and bass get their own icons', (await kinds('AC30 TB Normal')) === 'Combo|Guitar/Neural DSP' && (await kinds('King of Tone')) === 'Pedal|Guitar/Neural DSP' && (await kinds('Bedroom Clean')) === 'Preamp|Guitar/You' && (await kinds('SVT CL Bass')) === 'Amp head|Bass/Neural DSP', [await kinds('AC30 TB Normal'), await kinds('King of Tone'), await kinds('Bedroom Clean'), await kinds('SVT CL Bass')].join(', '));
   check('a default / instrument_not_set capture has no icons, just the author', (await kinds('My Plexi Lead')) === '/You', await kinds('My Plexi Lead'));
+  check('an amp_combo capture (a real pedal\'s word for a combo) gets the combo icon, labelled Combo, and logs nothing', (await kinds('Deluxe Reverb Clean')) === 'Combo|Guitar/Neural DSP' && (await js(`${rowOf('Deluxe Reverb Clean')}.querySelector(".sub .kind").innerHTML === ${rowOf('AC30 TB Normal')}.querySelector(".sub .kind").innerHTML`)) && (await js('__kindDebug.filter(l => /amp_combo/.test(l)).length')) === 0, await kinds('Deluxe Reverb Clean'));
   check('an unknown type word: no icon, raw word in the row tooltip, logged once', (await kinds('Zz Mystery')) === 'Guitar/Tester' && /mystery_box/.test(await js(`${rowOf('Zz Mystery')}.title`)) && (await js('__kindDebug.filter(l => /unknown capture kind mystery_box/.test(l)).length')) === 1, await js(`${rowOf('Zz Mystery')}?.title`) + ' ' + await js('JSON.stringify(__kindDebug)'));
   check('every capture row has a subtitle line', await js('document.querySelectorAll(".pop .pop-item.two").length === document.querySelectorAll(".pop .pop-item").length'));
   await shot('xx-library-kinds');
@@ -1350,9 +1412,18 @@ async function run() {
   await checkSoon('capture node shows it', async () => (await js('document.querySelector("[data-stage=capture] .model").textContent')) === libName);
   await checkSoon('no popover or dialog left open', '!document.querySelector(".pop") && !document.querySelector(".modal")');
   await key('5'); await frame();
-  await click('[data-fk="lib-cab"]'); await waitFor('document.querySelectorAll(".pop .pop-item").length >= 5');
-  check('cab rows in the library picker stay plain one-line names (no kind icons)', await js('document.querySelectorAll(".pop .pop-item").length >= 5 && !document.querySelector(".pop .pop-item.two, .pop .kind") && document.querySelector(".pop .pop-item").textContent === "412 V30"'), await js('document.querySelector(".pop .pop-item")?.outerHTML'));
-  await key('Escape'); await frame();
+  await waitFor('document.querySelectorAll(".cab-library-section .library-item").length >= 5');
+  check('cab library rows show plain names with preview controls', await js('(() => { const rows = [...document.querySelectorAll(".cab-library-section .library-row")]; return rows.length >= 5 && rows[0].querySelector(".library-item")?.textContent === "412 V30" && rows[0].querySelector(".library-preview")?.getAttribute("aria-label") === "Preview 412 V30" && !rows[0].querySelector(".kind"); })()'), await js('document.querySelector(".cab-library-section .library-row")?.outerHTML'));
+  await js('window.__libNode = document.querySelector(".cab-library-content")');
+  await click('[data-fk="cab-lib-search"]'); await type('412'); await js('render()'); await frame(); await js('render()'); await frame();
+  check('the cab library search keeps focus and its list is not rebuilt by redraws', await js('document.activeElement === document.querySelector("[data-fk=cab-lib-search]") && document.querySelector(".cab-library-content") === window.__libNode && document.activeElement.value === "412" && [...document.querySelectorAll(".cab-library-section .library-row")].filter(r => !r.hidden).length >= 2 && [...document.querySelectorAll(".cab-library-section .library-row")].filter(r => !r.hidden).every(r => /412/.test(r.textContent))'));
+  for (let i = 0; i < 3; i++) await key('Backspace');
+  check('… its caret stayed at the end: three Backspaces clear it and every cab and IR shows again', await js('document.querySelector("[data-fk=cab-lib-search]").value === "" && [...document.querySelectorAll(".cab-library-section .library-row")].every(r => !r.hidden)'), await js('document.querySelector("[data-fk=cab-lib-search]").value + " / hidden " + [...document.querySelectorAll(".cab-library-section .library-row")].filter(r => r.hidden).length'));
+  await js('document.activeElement.blur(); delete window.__libNode'); await frame();
+  await rightClick('[data-fk="node-cab"]');
+  await js(ctxItem('Pick a cab from the library') + '.click()');
+  await checkSoon('the cab node menu\'s "Pick a cab from the library…" goes to the library search', 'document.activeElement === document.querySelector("[data-fk=cab-lib-search]")');
+  await js('document.activeElement.blur()'); await frame();
   await key('4'); await frame();
 
   // ---------------------------------------------------------------- slot usage scan
@@ -1494,6 +1565,333 @@ async function run() {
   await checkSoon('upload flow finished cleanly', '!document.querySelector(".modal") && !__ui.uploading');
   await settle();
 
+  // ---------------------------------------------------------------- live capture preview and keep-alive
+  // Use the real preview transfer and timer, with the demo pedal answering the same type 151/149/92 messages.
+  const previewMeta = { hash: 'cd'.repeat(32), name: 'Test Preview', cloudUUID: '00000000-0000-4000-8000-000000000002', authorId: 'x', authorName: 'Tester', deviceType: 'pedal', gainType: 3, instrumentType: 'guitar', version: '1', tags: ['#test'] };
+  const previewSlot = await js('state.capture.selectedSlot');
+  await js(`(() => {
+    const originalSetInterval = window.setInterval;
+    const originalClearInterval = window.clearInterval;
+    window.__previewTimerTest = { originalSetInterval, originalClearInterval, callback: null, ms: null, id: null, cleared: false };
+    window.setInterval = (fn, ms) => { __previewTimerTest.callback = fn; __previewTimerTest.ms = ms; __previewTimerTest.id = 9171; return __previewTimerTest.id; };
+    window.clearInterval = id => { if (id === __previewTimerTest.id) __previewTimerTest.cleared = true; };
+  })()`);
+  n0 = await mark();
+  const previewResult = await js(`__previewCapture({ cns: [1, 2, 3, 4], meta: ${JSON.stringify(previewMeta)} })`);
+  await settle();
+  tx = await txSince(n0);
+  check('live preview sends the type-150 transfer', previewResult === true && tx.some(t => /^TX Capture preview "Test Preview" 1\/1: .* 96 00 00 00$/.test(t)), JSON.stringify(tx));
+  check('live preview becomes active without changing the loaded slot', await js('__ui.previewing && !__ui.previewBusy') && (await js('state.capture.selectedSlot')) === previewSlot);
+  check('live preview starts a 20-second keep-alive timer', await js('__previewTimerTest.ms === 20000 && typeof __previewTimerTest.callback === "function"'), await js('String(__previewTimerTest.ms)'));
+  n0 = await mark();
+  await js('__previewTimerTest.callback()');
+  tx = await txWait(n0, t => t.some(x => /^TX Preview keep-alive:/.test(x)));
+  check('keep-alive sends the confirmed type-91 frame', tx.length === 1 && tx[0] === 'TX Preview keep-alive: 06 C0 08 03 5B 00 00 00', JSON.stringify(tx));
+  await checkSoon('keep-alive type-92 response is acknowledged', '__ui.logs.some(l => l.text === "Live preview keep-alive acknowledged.")');
+  n0 = await mark();
+  const stopResult = await js('__stopCapturePreview()');
+  await settle();
+  tx = await txSince(n0);
+  check('stopping preview sends type 148 and receives confirmation', stopResult === true && tx.some(t => /^TX Stop capture preview: .* 94 00 00 00$/.test(t)) && await js('__ui.logs.some(l => /Capture preview stop confirmed/.test(l.text))'), JSON.stringify(tx));
+  check('stopping preview clears the keep-alive timer', await js('__previewTimerTest.cleared && !__ui.previewing && !__ui.previewBusy'));
+  await js('__previewTimerTest.callback()'); await settle();
+  check('a stopped preview does not send another keep-alive', !(await txSince(n0)).some(t => /^TX Preview keep-alive:/.test(t)));
+  await js('window.setInterval = __previewTimerTest.originalSetInterval; window.clearInterval = __previewTimerTest.originalClearInterval; delete window.__previewTimerTest');
+
+  // ---------------------------------------------------------------- streamed transfers: one at a time
+  check('MD5 for the 150/15 messages matches the reference (empty, "abc")', (await js('NanoTransfer.md5Hex(new Uint8Array()) + " " + NanoTransfer.md5Hex(new TextEncoder().encode("abc"))')) === 'd41d8cd98f00b204e9800998ecf8427e 900150983cd24fb0d6963f7d28e17f72');
+  n0 = await mark();
+  const mutex = await js(`(async () => {
+    const meta = ${JSON.stringify(previewMeta)};
+    const preview = NanoTransfer.previewCapture({ cns: new Uint8Array(3000), meta });
+    const busy = NanoTransfer.busy;
+    let err = '';
+    try { await NanoTransfer.downloadImpulseResponse({ wav: new Uint8Array(64), meta: { name: 'Mutex IR', productId: '00000000-0000-4000-8000-000000000003', filename: 'Mutex IR.wav' } }); }
+    catch (e) { err = e.message; }
+    const r = await preview;
+    const stop = await NanoTransfer.stopAudition('capture');
+    return { busy, err, ok: r.ok, stopped: stop.ok, after: NanoTransfer.busy };
+  })()`);
+  tx = await txWait(n0, t => t.some(x => /^TX Stop capture preview/.test(x)));
+  check('stream mutex: a Cloud IR (15) is refused while a capture preview (150) streams; the 150 completes', mutex.busy === 'capture preview' && /Another transfer to the pedal is still running/.test(mutex.err) && mutex.ok && mutex.stopped && mutex.after === '' && !tx.some(t => /Cloud IR download/.test(t)) && (() => { const parts = tx.filter(t => /^TX Capture preview "Test Preview" \d+\/\d+:/.test(t)); const m = parts.length && /\/(\d+):/.exec(parts[0]); return parts.length > 1 && m && Number(m[1]) === parts.length; })(), JSON.stringify(mutex) + ' ' + JSON.stringify(tx.map(t => t.slice(0, 50))));
+
+  // ---------------------------------------------------------------- Cloud IR checks in the shell (src/cloud-ir.js), no network
+  {
+    const cloudIR = require('../src/cloud-ir');
+    const wavOf = ({ format = 3, channels = 1, rate = 48000, bits = 32, data = 16, fmt = true, extensible = false, cut = 0, riff = 'RIFF' } = {}) => {
+      const fmtLen = extensible ? 40 : 16;
+      const chunks = [];
+      if (fmt) {
+        const f = Buffer.alloc(8 + fmtLen);
+        f.write('fmt ', 0); f.writeUInt32LE(fmtLen, 4);
+        f.writeUInt16LE(extensible ? 0xFFFE : format, 8); f.writeUInt16LE(channels, 10); f.writeUInt32LE(rate, 12);
+        f.writeUInt32LE(rate * channels * bits / 8, 16); f.writeUInt16LE(channels * bits / 8, 20); f.writeUInt16LE(bits, 22);
+        if (extensible) { f.writeUInt16LE(22, 24); f.writeUInt16LE(format, 32); }
+        chunks.push(f);
+      }
+      if (data) { const d = Buffer.alloc(8 + data); d.write('data', 0); d.writeUInt32LE(data + cut, 4); chunks.push(d); }
+      else { const l = Buffer.alloc(8 + 28); l.write('LIST', 0); l.writeUInt32LE(28, 4); chunks.push(l); }
+      const body = Buffer.concat(chunks);
+      const head = Buffer.alloc(12); head.write(riff, 0); head.writeUInt32LE(body.length + 4, 4); head.write('WAVE', 8);
+      return Buffer.concat([head, body]);
+    };
+    const why = (opts) => { try { cloudIR.checkWav(wavOf(opts)); return 'ok'; } catch (e) { return e.message; } };
+    check('Cloud IR check: a mono 48 kHz float WAV (the traced kind) passes', why() === 'ok', why());
+    check('Cloud IR check: 24-bit PCM stereo at 44.1 kHz and WAVE_FORMAT_EXTENSIBLE float pass', why({ format: 1, bits: 24, channels: 2, rate: 44100 }) === 'ok' && why({ extensible: true }) === 'ok', why({ format: 1, bits: 24, channels: 2, rate: 44100 }) + ' / ' + why({ extensible: true }));
+    check('Cloud IR check: a compressed WAV (format 2) is refused with the reason', /not PCM or floating-point audio \(WAV format 2\)/.test(why({ format: 2, bits: 16 })), why({ format: 2, bits: 16 }));
+    check('Cloud IR check: 6 channels are refused', /6 channels; the pedal takes mono or stereo/.test(why({ channels: 6 })), why({ channels: 6 }));
+    check('Cloud IR check: a 4 kHz or 384 kHz sample rate is refused', /sample rate \(4000 Hz\)/.test(why({ rate: 4000 })) && /384000 Hz/.test(why({ rate: 384000 })), why({ rate: 4000 }));
+    check('Cloud IR check: 8-bit PCM is refused', /8-bit PCM samples/.test(why({ format: 1, bits: 8 })), why({ format: 1, bits: 8 }));
+    check('Cloud IR check: no format chunk, no audio, a cut-short chunk or not RIFF are refused', /no format chunk/.test(why({ fmt: false, data: 64 })) && /no audio data/.test(why({ data: 0 })) && /cut short/.test(why({ cut: 100 })) && /not a WAV file/.test(why({ riff: 'RIFX' })), [why({ fmt: false, data: 64 }), why({ data: 0 }), why({ cut: 100 }), why({ riff: 'RIFX' })].join(' / '));
+    const big = (() => { try { cloudIR.decodeIRPayload('A'.repeat(1500000)); return 'ok'; } catch (e) { return e.message; } })();
+    check('Cloud IR check: a payload over 1 MB is refused before decoding', /larger than 1 MB/.test(big) && cloudIR.decodeIRPayload(wavOf().toString('base64')).length === wavOf().length, big);
+  }
+
+  // ---------------------------------------------------------------- Cortex Cloud IR → the pedal's library (15 → 16), and deleting it (82 → 83)
+  // A minimal valid WAV: RIFF/WAVE, fmt (float, mono, 48 kHz), 4 samples.
+  const wav = (() => {
+    const b = Buffer.alloc(44 + 16);
+    b.write('RIFF', 0); b.writeUInt32LE(b.length - 8, 4); b.write('WAVE', 8); b.write('fmt ', 12); b.writeUInt32LE(16, 16);
+    b.writeUInt16LE(3, 20); b.writeUInt16LE(1, 22); b.writeUInt32LE(48000, 24); b.writeUInt32LE(48000 * 4, 28); b.writeUInt16LE(4, 32); b.writeUInt16LE(32, 34);
+    b.write('data', 36); b.writeUInt32LE(16, 40);
+    return b.toString('base64');
+  })();
+  const irMeta = { name: 'Demo Cloud IR', productId: '00000000-0000-4000-8000-000000000004', filename: 'Demo Cloud IR.wav' };
+  n0 = await mark();
+  await js(`window.__irDone = __receiveCloudIR({ wav: ${JSON.stringify(wav)}, meta: ${JSON.stringify(irMeta)} }); 0`);
+  await checkSoon('a Cloud IR asks for confirmation first', '!!document.querySelector(".modal") && /Send Demo Cloud IR to the pedal/.test(document.querySelector(".modal h2").textContent)');
+  await key('Return');
+  tx = await txWait(n0, t => t.some(x => /^TX Cloud IR download/.test(x)));
+  const irOutcome = await js('window.__irDone');
+  check('the IR goes out as one type-15 message and the (demo) pedal adds it (16), then the library is read again', tx.some(t => /^TX Cloud IR download "Demo Cloud IR" 1\/1: [0-9A-F]{2} C0 08 06 1A .* 0F 00 00 00$/.test(t)) && irOutcome.ok && irOutcome.refreshed && irOutcome.index === 1 && tx.some(t => /^TX Library content request/.test(t)) && await js('state.library.irUser.some(x => x.name === "Demo Cloud IR" && x.index === 1)'), JSON.stringify(irOutcome) + ' ' + JSON.stringify(tx.map(t => t.slice(0, 60))));
+  n0 = await mark();
+  await js(`window.__irAgain = null; __receiveCloudIR({ wav: ${JSON.stringify(wav)}, meta: ${JSON.stringify(irMeta)} }).then(r => { window.__irAgain = r; }); 0`);
+  await waitFor('!!window.__irAgain || !!document.querySelector(".modal")');
+  if (await js('!!document.querySelector(".modal")')) { await key('Escape'); await waitFor('!!window.__irAgain'); }
+  const irAgain = await js('window.__irAgain');
+  await settle();
+  check('sending it again finds it on the pedal by name and sends nothing', irAgain.alreadyOnNano === true && await js('!document.querySelector(".modal")') && !(await txSince(n0)).some(t => /Cloud IR download/.test(t)), JSON.stringify(irAgain));
+
+  // Delete it again: right-click → Delete…; the library is read again right before the 82, which carries the user index and name.
+  await key('5'); await frame();
+  const userRow = '[...document.querySelectorAll(".cab-library-section .library-row")].find(r => r.querySelector(".library-item span")?.textContent === "Demo Cloud IR")';
+  await waitFor(`!!(${userRow})`);
+  await js('state.irNames.set(5, "Demo Cloud IR"); render()'); await frame();
+  await js(`(() => { const r = ${userRow}; r.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 200, clientY: 300 })); })()`);
+  await waitFor('!!document.querySelector(".ctx")');
+  await js(ctxItem('Delete') + '.click()');
+  await checkSoon('Delete asks first and says an IR slot holds that IR', '!!document.querySelector(".modal") && /Delete IR “Demo Cloud IR” from the pedal/.test(document.querySelector(".modal h2").textContent) && /IR slot 5/.test(document.querySelector(".modal").textContent)', () => js('document.querySelector(".modal")?.textContent'));
+  n0 = await mark();
+  await key('Return');
+  tx = (await txWait(n0, t => t.some(x => /^TX Delete IR/.test(x)))).filter(t => /^TX (Library content request|Delete IR)/.test(t));
+  const del82 = frameHex([0x08, 0x02, 0x22, 2 + 2 + utf8('Demo Cloud IR').length, 0x08, 0x01, 0x12, utf8('Demo Cloud IR').length, ...utf8('Demo Cloud IR')], 82);
+  check('IR delete: the library is read right before, then 82 carries the user index and name (exact bytes)', tx.length >= 2 && /^TX Library content request/.test(tx[0]) && tx[1] === 'TX Delete IR Demo Cloud IR: ' + del82, JSON.stringify(tx) + ' expected ' + del82);
+  await checkSoon('the (demo) pedal confirms (83) and the IR is gone from the list', async () => (await toastText()) === 'Demo Cloud IR deleted from the pedal IR library.' && await js('!state.library.irUser.some(x => x.name === "Demo Cloud IR")'));
+  await js('state.irNames.set(5, "212 Blue"); render()'); await settle();
+
+  // ---------------------------------------------------------------- IR audition (158 → 159), and every audition stops before Save or a switch
+  await waitFor('document.querySelectorAll(".cab-library-section .library-preview").length >= 6');
+  const firstPreview = '.cab-library-section .library-row .library-preview';
+  n0 = await mark();
+  await click(firstPreview);
+  tx = await txWait(n0, t => t.some(x => /^TX Preview IR/.test(x)));
+  const play412 = frameHex([0x1A, 4 + utf8('412 V30').length, 0x08, 0x00, 0x12, utf8('412 V30').length, ...utf8('412 V30'), 0x40, 0x01], 158);
+  check('previewing a factory cab sends 158 with the record in field 3 (exact bytes), nothing else', tx.length === 1 && tx[0] === 'TX Preview IR "412 V30": ' + play412, JSON.stringify(tx));
+  await checkSoon('the (demo) pedal accepts it (159): the row plays, the keep-alive runs', async () => await js('!!document.querySelector(".cab-library-section .library-row.previewing .library-preview.playing")') && await js(`__ui.logs.some(l => l.seq > ${n0} && /Live preview keep-alive started/.test(l.text))`));
+  const userPlay = await js('hex(__irPreviewRequest({ kind: "irUser", index: 0, name: "OwnHammer 412 Mix" }))');
+  check('a user IR goes in field 4 instead (exact bytes)', userPlay === frameHex([0x22, 4 + utf8('OwnHammer 412 Mix').length, 0x08, 0x00, 0x12, utf8('OwnHammer 412 Mix').length, ...utf8('OwnHammer 412 Mix'), 0x40, 0x01], 158), userPlay);
+  // Save while it plays: the stop (148 with field 4 = 0, confirmed by a 149 with the same transaction) goes first.
+  await js('state.presetDirty = false; document.activeElement.blur(); render()');
+  n0 = await mark();
+  await key('s', [MOD]);
+  tx = (await txWait(n0, t => t.some(x => /^TX save preset/.test(x)))).filter(t => /^TX (Stop IR preview|save preset|Preview keep-alive)/.test(t));
+  check('Save during an IR audition sends the stop first (148 {2:tx 4:0}), then saves', tx.length === 2 && /^TX Stop IR preview: [0-9A-F]{2} C0 10 ([0-9A-F]{2} )+20 00 94 00 00 00$/.test(tx[0]) && /^TX save preset/.test(tx[1]), JSON.stringify(tx));
+  await checkSoon('… the audition is over: row back to Play, keep-alive stopped', async () => await js('!document.querySelector(".library-preview.playing")') && await js(`__ui.logs.some(l => l.seq > ${n0} && /Live preview keep-alive stopped/.test(l.text))`));
+  await settle();
+  // The pedal doesn't confirm the stop: Save and a preset switch are refused and the audition stays shown as playing.
+  n0 = await mark();
+  await click(firstPreview);
+  await checkSoon('previewing again', '!!document.querySelector(".library-preview.playing")');
+  await js('__demo.hooks.refuseStop = true; state.presetDirty = false; render()');
+  n0 = await mark();
+  await key('s', [MOD]);
+  await txWait(n0, t => t.some(x => /^TX Stop IR preview/.test(x)));
+  check('a refused stop refuses Save: nothing saved, the IR still shows as playing, the user is told', !(await txSince(n0)).some(t => /^TX save preset/.test(t)) && await js('!!document.querySelector(".library-preview.playing")') && /did not confirm stopping the preview, so Save did not happen/.test(await toastText()), (await toastText()) + ' ' + JSON.stringify(await txSince(n0)));
+  const presetBefore = await js('state.selectedPreset');
+  const otherPreset = presetBefore === 1 ? 2 : 1;
+  n0 = await mark();
+  await click(`.preset-row[data-n="${otherPreset}"]`);
+  await txWait(n0, t => t.some(x => /^TX Stop IR preview/.test(x)));
+  check('… and refuses a preset switch: no 29 sent, still on the same preset', !(await txSince(n0)).some(t => /^TX Preset change/.test(t)) && (await js('state.selectedPreset')) === presetBefore && /the preset switch did not happen/.test(await toastText()), (await toastText()) + ' ' + JSON.stringify(await txSince(n0)));
+  await js('__demo.hooks.refuseStop = false');
+  n0 = await mark();
+  await click(`.preset-row[data-n="${otherPreset}"]`);
+  tx = (await txWait(n0, t => t.some(x => /^TX Preset change/.test(x)))).filter(t => /^TX (Stop IR preview|Preset change \d)/.test(t));
+  check('once the pedal confirms, the switch goes ahead: stop first, then the preset change', tx.length === 2 && /^TX Stop IR preview/.test(tx[0]) && /^TX Preset change \d+:/.test(tx[1]) && (await js('state.selectedPreset')) === otherPreset, JSON.stringify(tx));
+  await settle();
+  // A preset change on the pedal itself (footswitch) during an audition: it is stopped and forgotten.
+  await click(firstPreview);
+  await checkSoon('previewing once more', '!!document.querySelector(".library-preview.playing")');
+  n0 = await mark();
+  await js('window.onC305({ target: { value: { buffer: buildFrame([0x18, 0x00, 0x20, state.selectedPreset - 1], MSG.SetPresetSlotsRequest).buffer } } })');
+  tx = await txWait(n0, t => t.some(x => /^TX Stop IR preview/.test(x)));
+  await checkSoon('a footswitch preset change ends the audition (stop sent, keep-alive off, row back to Play)', async () => tx.some(t => /^TX Preset change ack/.test(t)) && await js('!document.querySelector(".library-preview.playing")') && await js(`__ui.logs.some(l => l.seq > ${n0} && /Live preview keep-alive stopped/.test(l.text))`), () => JSON.stringify(tx));
+  await settle();
+  // Capture preview: a refused stop keeps it honest (still previewing) and the toolbar shows Stop Preview with the error.
+  n0 = await mark();
+  check('capture preview starts', (await js(`__previewCapture({ cns: [1, 2, 3, 4], meta: ${JSON.stringify(previewMeta)} })`)) === true && await js('__previewToolbar().active && __previewToolbar().phase === "active"'));
+  await js('__demo.hooks.refuseStop = true');
+  const refusedStop = await js('__stopCapturePreview()');
+  check('a refused capture-preview stop leaves it previewing and the toolbar on Stop Preview, with the reason', refusedStop === false && await js('__ui.previewing && !__ui.previewBusy && __previewToolbar().active && __previewToolbar().phase === "active" && /did not confirm/.test(__previewToolbar().error)'), JSON.stringify(await js('__previewToolbar()')));
+  await js('__demo.hooks.refuseStop = false');
+  check('a confirmed stop sets the toolbar back to idle', (await js('__stopCapturePreview()')) === true && await js('!__ui.previewing && !__previewToolbar().active && __previewToolbar().phase === "idle"'), JSON.stringify(await js('__previewToolbar()')));
+  await key('4'); await frame(); await settle();
+
+  // ---------------------------------------------------------------- after a capture preview stops, the state is read again
+  // While the pedal plays a preview its state names the previewed capture; the native edition kept showing that name
+  // after the stop until the next state read (seen on the pedal, 2026-10-24). The demo pedal reports it the same way.
+  const nodeModel = (k) => js(`document.querySelector('[data-fk="node-${k}"] .model')?.textContent || ''`);
+  const ownCapture = await nodeModel('capture');
+  check('a capture preview starts (re-read)', (await js(`__previewCapture({ cns: [1, 2, 3, 4], meta: ${JSON.stringify(previewMeta)} })`)) === true && ownCapture !== '' && ownCapture !== 'Test Preview', ownCapture);
+  n0 = await mark();
+  await js('window.onC305({ target: { value: { buffer: buildFrame([0x08, 0x01], 31).buffer } } })');   // "something changed": one state read
+  await txWait(n0, t => t.some(x => /^TX Current preset state request/.test(x)));
+  await checkSoon('during a preview a state read names the previewed capture (as the pedal reports it)', async () => (await nodeModel('capture')) === 'Test Preview', async () => await nodeModel('capture'));
+  await js('__demo.hooks.refuseStop = true');
+  n0 = await mark();
+  check('a refused stop (re-read)', (await js('__stopCapturePreview({ quiet: true })')) === false);
+  await settle();
+  check('… reads nothing: the preview may still be playing', !(await txSince(n0)).some(t => /^TX Current preset state request/.test(t)) && (await nodeModel('capture')) === 'Test Preview', JSON.stringify(await txSince(n0)));
+  await js('__demo.hooks.refuseStop = false');
+  n0 = await mark();
+  check('stopping the preview (re-read)', (await js('__stopCapturePreview()')) === true);
+  tx = (await txWait(n0, t => t.some(x => /^TX Current preset state request/.test(x)))).filter(t => /^TX (Stop capture preview|Current preset state request)/.test(t));
+  const confirmedAt = await js(`(__ui.logs.find(l => l.seq > ${n0} && /^Capture preview stop confirmed/.test(l.text)) || {}).seq || 0`);
+  const readAt = await js(`(__ui.logs.find(l => l.seq > ${n0} && /^TX Current preset state request/.test(l.text)) || {}).seq || 0`);
+  check('after a confirmed capture-preview stop the state is read again: 148, the 149, then one state request', tx.length === 2 && /^TX Stop capture preview/.test(tx[0]) && /^TX Current preset state request: 0C C0 08 03 18 01 20 01 28 01 01 00 00 00$/.test(tx[1]) && confirmedAt > 0 && readAt > confirmedAt, JSON.stringify(tx) + ' ' + confirmedAt + '/' + readAt);
+  check('… and the chain shows the preset\'s own capture again, not the previewed one', (await nodeModel('capture')) === ownCapture, await nodeModel('capture'));
+  await settle();
+
+  // ---------------------------------------------------------------- quitting during an audition (src/quit-guard.js)
+  // The shell's guard with the real page: the page reports whether anything is auditioned (nanoShell.auditionState;
+  // here __auditionShown()), and the guard runs __stopAuditionsForQuit() as main does with executeJavaScript.
+  {
+    const { createQuitGuard, QUIT_CAP_MS, QUIT_LINES } = require('../src/quit-guard');
+    const quitEvent = () => ({ prevented: false, preventDefault() { this.prevented = true; } });
+    const makeGuard = (opts = {}) => {
+      const g = { quits: 0, lines: [], shown: false, t0: 0, quitAt: 0, nexts: 0 };
+      g.guard = createQuitGuard({
+        isAuditioning: () => g.shown,
+        stopAuditions: opts.stop || (() => js('__stopAuditionsForQuit()')),
+        quit: () => { g.quits++; g.quitAt = Date.now(); },
+        log: (line) => g.lines.push(line),
+        ...(opts.capMs ? { capMs: opts.capMs } : {}),
+      });
+      g.sync = async () => { g.shown = await js('__auditionShown()'); return g.shown; };
+      g.quit = () => { g.t0 = Date.now(); const e = quitEvent(); g.guard.intercept(e); return e; };
+      return g;
+    };
+    check('the quit guard waits at most 1.5 s', QUIT_CAP_MS === 1500);
+    check('quit lines, word for word the native edition\'s: "Quit: stopped the preview first (the pedal confirmed in N ms).", "Quit: the pedal did not confirm stopping the preview; quitting anyway.", "Quit: the pedal did not answer the preview stop within 1.5 s; quitting anyway."',
+      QUIT_LINES.stopped(42.4) === 'Quit: stopped the preview first (the pedal confirmed in 42 ms).' && QUIT_LINES.notConfirmed === 'Quit: the pedal did not confirm stopping the preview; quitting anyway.' && QUIT_LINES.timedOut(QUIT_CAP_MS) === 'Quit: the pedal did not answer the preview stop within 1.5 s; quitting anyway.');
+    const stoppedLine = (lines) => lines.length === 1 && /^Quit: stopped the preview first \(the pedal confirmed in \d+ ms\)\.$/.test(lines[0]);
+    let g = makeGuard();
+    n0 = await mark();
+    await g.sync();
+    let e = g.quit();
+    check('quitting with nothing auditioned is not held (no stop, no line)', !g.shown && !e.prevented && g.quits === 0 && g.lines.length === 0 && (await txSince(n0)).length === 0);
+
+    // A Live Preview playing: the quit waits for the stop and the pedal's confirmation, then quits once.
+    check('a capture preview starts (quit)', (await js(`__previewCapture({ cns: [1, 2, 3, 4], meta: ${JSON.stringify(previewMeta)} })`)) === true);
+    check('… and the page has told the shell that something is auditioned', await g.sync());
+    n0 = await mark();
+    e = g.quit();
+    const again = quitEvent(); g.guard.intercept(again);   // ⌘Q again, or the window's close that follows
+    check('quitting during a Live Preview is held (and so is a second quit or the window close meanwhile)', e.prevented && again.prevented && g.quits === 0);
+    await waitFor(() => g.quits > 0, { timeout: 4000 });
+    tx = await txWait(n0, t => t.some(x => /^TX Stop capture preview/.test(x)));
+    check('… the page sends the stop (148) once, the pedal confirms (149), then the app quits, once', g.quits === 1 && tx.filter(t => /^TX Stop capture preview: .* 94 00 00 00$/.test(t)).length === 1 && await js(`__ui.logs.some(l => l.seq > ${n0} && /^Capture preview stop confirmed/.test(l.text))`) && g.quitAt - g.t0 < QUIT_CAP_MS, JSON.stringify(tx) + ' ' + (g.quitAt - g.t0) + ' ms');
+    check('… with one Activity line: "Quit: stopped the preview first (the pedal confirmed in N ms)."', stoppedLine(g.lines), JSON.stringify(g.lines));
+    check('… no state read on the way out, the keep-alive stopped, nothing auditioned any more', !tx.some(t => /^TX Current preset state request/.test(t)) && await js(`!__ui.previewing && !__ui.previewBusy && __ui.logs.some(l => l.seq > ${n0} && /Live preview keep-alive stopped/.test(l.text))`) && !(await g.sync()), JSON.stringify(tx));
+    e = g.quit();
+    check('once it has run, the next quit goes through', !e.prevented && g.quits === 1);
+
+    // A library IR audition: the IR stop (148 with field 4).
+    g = makeGuard();
+    check('an IR audition starts (quit)', (await js('__previewIR({ kind: "irFactory", index: 0, name: "412 V30" })')) === true && await g.sync());
+    n0 = await mark();
+    e = g.quit();
+    await waitFor(() => g.quits > 0, { timeout: 4000 });
+    tx = await txWait(n0, t => t.some(x => /^TX Stop IR preview/.test(x)));
+    check('quitting during an IR audition sends the IR stop (148 {2:tx 4:0}) and quits after the confirmation', e.prevented && g.quits === 1 && tx.filter(t => /^TX Stop IR preview: [0-9A-F]{2} C0 10 ([0-9A-F]{2} )+20 00 94 00 00 00$/.test(t)).length === 1 && stoppedLine(g.lines) && await js('!document.querySelector(".library-preview.playing")'), JSON.stringify(tx) + ' ' + JSON.stringify(g.lines));
+    await settle();
+
+    // A pedal that refuses the stop: quit anyway, at once, and say so.
+    g = makeGuard();
+    await js(`__previewCapture({ cns: [1, 2, 3, 4], meta: ${JSON.stringify(previewMeta)} })`);
+    await g.sync();
+    await js('__demo.hooks.refuseStop = true');
+    e = g.quit();
+    await waitFor(() => g.quits > 0, { timeout: 4000 });
+    check('a pedal that refuses the stop: the app still quits, without waiting out the 1.5 s, and the line says the pedal did not confirm', e.prevented && g.quits === 1 && g.quitAt - g.t0 < QUIT_CAP_MS && JSON.stringify(g.lines) === JSON.stringify([QUIT_LINES.notConfirmed]), (g.quitAt - g.t0) + ' ms ' + JSON.stringify(g.lines));
+    await js('__demo.hooks.refuseStop = false');
+    check('(the preview is stopped for real afterwards)', (await js('__stopCapturePreview({ quiet: true })')) === true);
+    await settle();
+
+    // A slow pedal: one that answers within 1.5 s is waited for; one that doesn't is not.
+    g = makeGuard();
+    await js(`__previewCapture({ cns: [1, 2, 3, 4], meta: ${JSON.stringify(previewMeta)} })`);
+    await g.sync();
+    await js('__demo.hooks.stopDelay = 400');
+    e = g.quit();
+    await waitFor(() => g.quits > 0, { timeout: 4000 });
+    check('a slow pedal (answers after 0.4 s): the quit waits for it, then quits with "Quit: stopped the preview first (the pedal confirmed in N ms)."', e.prevented && g.quits === 1 && g.quitAt - g.t0 >= 380 && g.quitAt - g.t0 < QUIT_CAP_MS && stoppedLine(g.lines) && Number(/in (\d+) ms/.exec(g.lines[0])[1]) >= 380, (g.quitAt - g.t0) + ' ms ' + JSON.stringify(g.lines));
+    await settle();
+    g = makeGuard();
+    await js(`__previewCapture({ cns: [1, 2, 3, 4], meta: ${JSON.stringify(previewMeta)} })`);
+    await g.sync();
+    await js('__demo.hooks.stopDelay = 2600');
+    e = g.quit();
+    await waitFor(() => g.quits > 0, { timeout: 4000 });
+    check('a pedal that answers after 2.6 s: the app quits at the 1.5 s cap, with "Quit: the pedal did not answer the preview stop within 1.5 s; quitting anyway."', e.prevented && g.quits === 1 && g.quitAt - g.t0 >= QUIT_CAP_MS - 50 && g.quitAt - g.t0 < QUIT_CAP_MS + 1000 && JSON.stringify(g.lines) === JSON.stringify([QUIT_LINES.timedOut(QUIT_CAP_MS)]), (g.quitAt - g.t0) + ' ms ' + JSON.stringify(g.lines));
+    await waitFor('!__ui.previewing && !__ui.previewBusy', { timeout: 4000 });
+    await js('__demo.hooks.stopDelay = 0');
+    check('(that preview ends when the late confirmation arrives)', await js('!__ui.previewing && !__ui.previewBusy'));
+    await settle();
+
+    // The page is gone or hung: never blocks quitting.
+    g = makeGuard({ stop: () => Promise.reject(new Error('Render frame was disposed before WebFrameMain could be accessed')) });
+    g.shown = true;
+    e = g.quit();
+    await waitFor(() => g.quits > 0, { timeout: 1000 });
+    check('the editor page gone (executeJavaScript fails): quits at once, "did not confirm" line', e.prevented && g.quits === 1 && g.quitAt - g.t0 < 300 && JSON.stringify(g.lines) === JSON.stringify([QUIT_LINES.notConfirmed]), (g.quitAt - g.t0) + ' ms');
+    g = makeGuard({ stop: () => new Promise(() => {}), capMs: 250 });
+    g.shown = true;
+    e = g.quit();
+    await waitFor(() => g.quits > 0, { timeout: 2000 });
+    check('a page that never answers: quits at the cap ("did not answer … within 0.3 s")', e.prevented && g.quits === 1 && g.quitAt - g.t0 >= 240 && JSON.stringify(g.lines) === JSON.stringify(['Quit: the pedal did not answer the preview stop within 0.3 s; quitting anyway.']), (g.quitAt - g.t0) + ' ms');
+    g = makeGuard({ stop: () => Promise.resolve({ active: false, ok: true }) });
+    g.shown = true;   // the shell thought so, but the page says nothing plays: quit, no line
+    g.quit();
+    await waitFor(() => g.quits > 0, { timeout: 1000 });
+    check('the page says nothing is auditioned after all: quits, no line', g.quits === 1 && g.lines.length === 0);
+
+    // The update modal's Restart: the stop first, then the updater (which quits by itself).
+    g = makeGuard();
+    await js(`__previewCapture({ cns: [1, 2, 3, 4], meta: ${JSON.stringify(previewMeta)} })`);
+    await g.sync();
+    n0 = await mark();
+    await g.guard.beforeRestart(() => { g.nexts++; });
+    tx = await txWait(n0, t => t.some(x => /^TX Stop capture preview/.test(x)));
+    e = g.quit();
+    check('Restart (update) during an audition: the stop goes first, then the updater runs; its quit is not held again', g.nexts === 1 && g.quits === 0 && !e.prevented && tx.some(t => /^TX Stop capture preview/.test(t)) && stoppedLine(g.lines), JSON.stringify(tx));
+    g = makeGuard();
+    await g.sync();
+    await g.guard.beforeRestart(() => { g.nexts++; });
+    check('Restart with nothing auditioned runs the updater at once', g.nexts === 1 && g.lines.length === 0);
+    await settle();
+  }
+
   // ---------------------------------------------------------------- write coalescing
   // Deterministic: the first write leaves at once, the next five queue behind it under one key and merge.
   n0 = await mark();
@@ -1559,18 +1957,23 @@ async function run() {
   // metronome
   await click('#settingsBtn'); await waitFor(settingsOpen);
   check('Connection: reconnect at launch is shown disabled, with the reason, outside the desktop app', await js('document.querySelector(\'[data-fk="set-autoconnect"]\').disabled && /Web Bluetooth/.test(document.querySelector(\'[data-fk="set-pedal"]\').textContent)'));
-  check('Metronome offers Click, Woodblock, Tick, Beep and Cowbell', (await js('[...document.querySelectorAll(\'[data-fk="set-sound"] option\')].map(o => o.textContent).join(",")')) === 'Click,Woodblock,Tick,Beep,Cowbell');
-  await js('{ const s = document.querySelector(\'[data-fk="set-sound"]\'); s.value = "tick"; s.dispatchEvent(new Event("change")); }');
-  await click('[data-fk="set-preview"]');
-  await checkSoon('Preview plays the chosen sound', async () => (await js('__metro.state.lastVoice')) === 'tick');
-  await js('{ const s = document.querySelector(\'[data-fk="set-sound"]\'); s.value = "woodblock"; s.dispatchEvent(new Event("change")); }');
-  check('the sound choice is stored with the metronome settings', (await js('JSON.parse(localStorage.getItem("metronome")).sound')) === 'woodblock');
+  const soundRows = () => js('[...document.querySelectorAll(\'[data-fk^="set-snd-"]\')].map(r => r.querySelector(".set-label").textContent + ": " + [...r.querySelector("select").options].map(o => o.textContent).join(",")).join(" | ")');
+  check('Metronome → Sounds: Accent, Main beat and Subdivision, each with Click, Woodblock, Tick, Beep, Cowbell and Custom sample…',
+    (await soundRows()) === ['Accent', 'Main beat', 'Subdivision'].map(l => l + ': Click,Woodblock,Tick,Beep,Cowbell,Custom sample…').join(' | ') && (await js('document.querySelector(".set-sub").textContent')) === 'Sounds', await soundRows());
+  check('a sound row without a custom sample is just its menu and ▶ (no stray text)', await js('[...document.querySelectorAll(\'[data-fk^="set-snd-"] .set-ctl\')].every(c => c.childNodes.length === 2 && c.children.length === 2 && c.textContent === c.querySelector("select").textContent)'));
+  check('outside the desktop app "Custom sample…" is disabled', await js('[...document.querySelectorAll(\'[data-fk^="set-sound-"] option[value=pick]\')].every(o => o.disabled)'));
+  await setSel('set-sound-main', 'tick');
+  await click('[data-fk="set-play-main"]');
+  await checkSoon('▶ plays that role\'s sound', async () => (await js('__metro.state.lastVoice')) === 'tick');
+  await setSel('set-sound-main', 'woodblock');
+  check('each role\'s sound is stored with the metronome settings', await js('(() => { const m = JSON.parse(localStorage.getItem("metronome")); return m.sounds.main === "woodblock" && m.sounds.accent === "click" && m.sounds.sub === "click" && !("sound" in m); })()'));
   await js('{ const b = document.querySelector(\'[data-fk="set-bpm"]\'); b.value = "200"; b.dispatchEvent(new Event("change")); const v = document.querySelector(\'[data-fk="set-volume"]\'); v.value = "0.4"; v.dispatchEvent(new Event("input")); }');
   check('default tempo and volume land in the overlay\'s stored keys', await js('(() => { const m = JSON.parse(localStorage.getItem("metronome")); return m.bpm === 200 && m.volume === 0.4; })()'));
   await click('[data-fk="set-drawer"]');
   check('"Show the Activity drawer at launch" is stored', (await js('JSON.parse(localStorage.getItem("settings.drawerAtLaunch"))')) === true);
   // advanced metronome defaults
-  check('Settings → Metronome adds Opens in, Pattern, Subdivision, Count-in and the three levels', (await js('[...document.querySelectorAll(".settings section")].find(x => x.querySelector("h3").textContent === "Metronome").textContent')).match(/Opens in|Pattern|Subdivision|Count-in|Accent level|Main ticks level|Subdivisions level/g).length === 7);
+  const metroLabels = await js('[...[...document.querySelectorAll(".settings section")].find(x => x.querySelector("h3").textContent === "Metronome").querySelectorAll(".set-label")].map(l => l.textContent)');
+  check('Settings → Metronome adds Opens in, Pattern, Subdivision, Count-in and the three levels', ['Opens in', 'Pattern', 'Subdivision', 'Count-in', 'Accent level', 'Main ticks level', 'Subdivisions level'].every(l => metroLabels.includes(l)), metroLabels.join('|'));
   check('Settings shows the levels set in the popover', await js('document.querySelector(\'[data-fk="set-lvl-accent"]\').value === "0.5" && document.querySelector(\'[data-fk="set-lvl-sub"]\').value === "0.25"'));
   check('Opens in defaults to Simple', (await js('document.querySelector(\'[data-fk="set-opens"]\').value')) === 'simple');
   for (const [fk, v] of [['set-opens', 'advanced'], ['set-pattern', '7/8'], ['set-subdiv', '3'], ['set-countin', '2']]) await js(`{ const s = document.querySelector('[data-fk="${fk}"]'); s.value = "${v}"; s.dispatchEvent(new Event("change")); }`);
@@ -1583,7 +1986,9 @@ async function run() {
   check('the metronome overlay shows the settings (200 BPM, volume 0.4)', await js('document.getElementById("metroBpm").value === "200" && document.getElementById("metroVol").value === "0.4"'));
   check('Settings "Opens in: Advanced" is honoured', await js('__metro.state.mode === "advanced" && !document.getElementById("metroAdv").hidden && document.querySelectorAll(".metro-cell").length === 7'));
   await key(' ');
-  await checkSoon('the metronome schedules the chosen sound and still runs', '__metro.state.running && __metro.state.count >= 1 && __metro.state.lastVoice === "woodblock"', () => js('JSON.stringify({ r: __metro.state.running, c: __metro.state.count, v: __metro.state.lastVoice })'));
+  await checkSoon('the metronome schedules each role\'s sound (main beats: Woodblock, accents: Click) and still runs',
+    '__metro.state.running && __metro.state.count >= 1 && __metro.state.scheduled.some(e => e.role === "accent") && __metro.state.scheduled.some(e => e.role === "normal") && __metro.state.scheduled.every(e => e.sound === ({ accent: "click", normal: "woodblock", soft: "woodblock", sub: "click", mute: null })[e.role])',
+    () => js('JSON.stringify({ r: __metro.state.running, c: __metro.state.count, ev: __metro.state.scheduled.slice(0, 8).map(e => e.role + ":" + e.sound) })'));
   await key(' ');
   await checkSoon('and still stops', '!__metro.state.running');
   await key('Escape'); await waitFor('!__metro.state.open');
@@ -1591,7 +1996,7 @@ async function run() {
   // persistence across a reload
   await reloadPage();
   check('the accent survives a reload', (await js('getComputedStyle(document.documentElement).getPropertyValue("--accent").trim()')) === '#ff7000' && (await js('getComputedStyle(document.querySelector(".preset-row.active")).boxShadow')).includes('rgb(255, 112, 0)'));
-  check('the sound and tempo survive a reload', await js('__metro.state.sound === "woodblock" && __metro.state.bpm === 200'));
+  check('the sounds and tempo survive a reload', await js('__metro.state.sounds.main === "woodblock" && __metro.state.sounds.accent === "click" && __metro.state.bpm === 200'));
   check('the Activity drawer opens at launch when set', await js('document.getElementById("drawer").classList.contains("open")'));
   check('the advanced setup, levels and Opens in survive a reload', await js('(() => { const s = __metro.state; return s.opensIn === "advanced" && s.adv.pattern.join() === "accent,soft,normal,soft,normal,soft,soft" && s.adv.note === 8 && s.adv.sub === 3 && s.adv.countIn === 2 && s.levels.accent === 0.5 && s.levels.main === 0.8 && s.levels.sub === 0.25; })()'));
   await js('document.activeElement.blur()');
@@ -1599,9 +2004,224 @@ async function run() {
   await checkSoon('after a reload the overlay opens in Advanced with the remembered pattern', () => js('__metro.state.mode === "advanced" && document.querySelector(\'[data-fk="metro-pattern"]\').value === "7/8" && document.querySelector(\'[data-fk="metro-sub-3"]\').classList.contains("on")'));
   await key('Escape'); await waitFor('!__metro.state.open');
   // back to the defaults for the rest of the run (and the next one)
-  await js('__accent.set("#6954ff"); localStorage.removeItem("settings.drawerAtLaunch"); __metro.state.sound = "click"; __metro.state.volume = 0.6; __metro.state.opensIn = "simple"; __metro.state.mode = "simple"; __metro.state.adv = __metro.normSetup({}); Object.assign(__metro.state.levels, { accent: 1, main: 1, sub: 1 }); __metro.setBpm(100)');
+  await js('__accent.set("#6954ff"); localStorage.removeItem("settings.drawerAtLaunch"); __metro.state.sounds = { accent: "click", main: "click", sub: "click" }; __metro.state.volume = 0.6; __metro.state.opensIn = "simple"; __metro.state.mode = "simple"; __metro.state.adv = __metro.normSetup({}); Object.assign(__metro.state.levels, { accent: 1, main: 1, sub: 1 }); __metro.setBpm(100)');
   await key('l', [MOD]);
   check('Purple restores the original colours', (await js('getComputedStyle(document.documentElement).getPropertyValue("--accent-hi").trim()')) === '#7b68ff' && (await js('getComputedStyle(document.documentElement).getPropertyValue("--on-accent").trim()')) === '#ffffff');
+
+  // ---------------------------------------------------------------- custom metronome samples
+  // The shell's side (src/metro-samples.js) with a temporary folder and a stub file dialog. The test carries the page's
+  // requests to it as the IPC does: the page's bridge (set through __metro.samples.setBridge, which also runs the
+  // launch-time load) queues { op, role }, the pump below answers with the real module, bytes as base64.
+  {
+    const { createMetroSamples, EXTS, MAX_BYTES } = require('../src/metro-samples');
+    const sdir = path.join(OUT, 'metronome-sounds'), srcDir = path.join(OUT, 'sample-sources');
+    for (const d of [sdir, srcDir]) fs.rmSync(d, { recursive: true, force: true });
+    fs.mkdirSync(srcDir, { recursive: true });
+    // Test files, generated here: 16-bit PCM WAV (by default a decaying 1 kHz tone) and 16-bit AIFF (a known ramp).
+    const tone = (i, _c, rate) => Math.round(12000 * Math.sin(2 * Math.PI * 1000 * i / rate) * Math.exp(-8 * i / rate));
+    const wavBytes = (seconds, channels = 1, rate = 44100, value = tone) => {
+      const n = Math.round(seconds * rate), data = Buffer.alloc(n * channels * 2);
+      for (let i = 0; i < n; i++) for (let c = 0; c < channels; c++) data.writeInt16LE(value(i, c, rate), (i * channels + c) * 2);
+      const h = Buffer.alloc(44);
+      h.write('RIFF', 0); h.writeUInt32LE(36 + data.length, 4); h.write('WAVEfmt ', 8); h.writeUInt32LE(16, 16); h.writeUInt16LE(1, 20); h.writeUInt16LE(channels, 22);
+      h.writeUInt32LE(rate, 24); h.writeUInt32LE(rate * channels * 2, 28); h.writeUInt16LE(channels * 2, 32); h.writeUInt16LE(16, 34); h.write('data', 36); h.writeUInt32LE(data.length, 40);
+      return Buffer.concat([h, data]);
+    };
+    const aiffBytes = (seconds, rate = 44100) => {
+      const n = Math.round(seconds * rate), data = Buffer.alloc(n * 2);
+      for (let i = 0; i < n; i++) data.writeInt16BE(-16000 + (i % 100) * 10, i * 2);
+      const comm = Buffer.alloc(26), e = Math.floor(Math.log2(rate));
+      comm.write('COMM', 0); comm.writeUInt32BE(18, 4); comm.writeUInt16BE(1, 8); comm.writeUInt32BE(n, 10); comm.writeUInt16BE(16, 14);
+      comm.writeUInt16BE(16383 + e, 16); comm.writeBigUInt64BE(BigInt(rate) << BigInt(63 - e), 18);   // the rate as an 80-bit float
+      const ssnd = Buffer.alloc(16); ssnd.write('SSND', 0); ssnd.writeUInt32BE(8 + data.length, 4);
+      const body = Buffer.concat([Buffer.from('AIFF'), comm, ssnd, data]), form = Buffer.alloc(8);
+      form.write('FORM', 0); form.writeUInt32BE(body.length, 4);
+      return Buffer.concat([form, body]);
+    };
+    const source = (name, bytes) => { const f = path.join(srcDir, name); fs.writeFileSync(f, bytes); return f; };
+    const stored = () => fs.existsSync(sdir) ? fs.readdirSync(sdir).sort().join(',') : '';
+    let nextPick = null;
+    const dialogs = [];
+    const shell = createMetroSamples({ dir: sdir, choose: async (role, opts) => { dialogs.push({ role, ...opts }); return nextPick; } });
+    let pumping = true;
+    const pump = (async () => {
+      while (pumping) {
+        let q = [];
+        try { q = await js('typeof __sb === "undefined" ? [] : __sb.q.splice(0)'); } catch { /* reloading */ }
+        for (const c of q) {
+          const r = await shell.handle(c.op, c.role);
+          const out = r && r.bytes ? { ...r, bytes: Buffer.from(r.bytes).toString('base64') } : r;
+          try { await js(`__sb.done(${c.id}, ${JSON.stringify(out)})`); } catch { /* reloading */ }
+        }
+        await sleep(15);
+      }
+    })();
+    // The bridge, as the preload's nanoShell.metroSample would be; resolves to the roles the launch-time load gave up on.
+    const connectShell = () => js(`(() => {
+      window.__sb = { n: 0, q: [], wait: {}, done(id, r) { if (r && r.bytes) r.bytes = Uint8Array.from(atob(r.bytes), c => c.charCodeAt(0)); this.wait[id](r); delete this.wait[id]; } };
+      return __metro.samples.setBridge((op, role) => new Promise((res) => { const id = ++__sb.n; __sb.wait[id] = res; __sb.q.push({ id, op, role }); }));
+    })()`);
+    // Every buffer the page starts, with the gain it goes through, and every toast.
+    const instrument = () => js(`(() => {
+      window.__plays = []; window.__toasts = []; window.__cuts = [];
+      new MutationObserver(() => __toasts.push(document.getElementById('toast').textContent)).observe(document.getElementById('toast'), { childList: true, characterData: true, subtree: true });
+      const P = AudioContext.prototype, make = P.createBufferSource;
+      if (P.__wrapped) return; P.__wrapped = true;
+      P.createBufferSource = function () {
+        const n = make.call(this), connect = n.connect.bind(n), start = n.start.bind(n);
+        let gain = null;
+        n.connect = (d, ...a) => { if (d instanceof GainNode) gain = d.gain.value; return connect(d, ...a); };
+        const stop = n.stop.bind(n), play = { buffer: null, at: 0, gain: null, stop: null };
+        n.start = (at, ...a) => { Object.assign(play, { buffer: n.buffer, at, gain }); __plays.push(play); if (__plays.length > 1000) __plays.shift(); return start(at, ...a); };
+        n.stop = (t) => { play.stop = t; return stop(t); };
+        return n;
+      };
+      const ramp = AudioParam.prototype.linearRampToValueAtTime;   // a cut is the only ramp to exactly 0
+      AudioParam.prototype.linearRampToValueAtTime = function (v, t) { if (v === 0) __cuts.push(t); return ramp.call(this, v, t); };
+    })()`);
+    const toastNow = () => js('document.getElementById("toast").classList.contains("show") ? document.getElementById("toast").textContent : ""');
+    const refusal = () => js('(() => { const m = document.querySelector(\'[data-fk="set-sound-msg"]\'); return m && !m.hidden && m.getClientRects().length ? m.textContent : ""; })()');
+    const metroStore = () => js('JSON.parse(localStorage.getItem("metronome") || "{}")');
+    const openSet = async () => { await click('#settingsBtn'); await waitFor(settingsOpen); };
+    const closeSet = async () => { await key('Escape'); await waitFor(async () => !(await settingsOpen())); };
+    const choose = async (role, file) => {   // "Custom sample…" in the role's menu, with the stub dialog answering `file`
+      nextPick = file;
+      const before = dialogs.length;
+      await setSel('set-sound-' + role, 'pick');
+      await waitFor(async () => dialogs.length > before && await js(`!document.querySelector('[data-fk="set-sound-${role}"]').disabled`));
+      await frame();
+    };
+
+    await instrument();
+    check('samples: the launch-time load has nothing to do on a fresh install', (await connectShell()).length === 0 && (await js('__toasts.length')) === 0);
+    await openSet();
+    check('samples: in the desktop app "Custom sample…" is enabled', await js('[...document.querySelectorAll(\'[data-fk^="set-sound-"] option[value=pick]\')].every(o => !o.disabled)'));
+
+    // Pick a WAV for the main beat: copied into the data folder, stored, shown, decoded once and used.
+    const clickWav = wavBytes(0.25);
+    const clickSrc = source('My Click.wav', clickWav);
+    await choose('main', clickSrc);
+    await checkSoon('samples: picking a WAV for Main beat copies it to metronome-sounds/main.wav', async () => stored() === 'main.wav' && fs.readFileSync(path.join(sdir, 'main.wav')).equals(clickWav), stored);
+    check('samples: the dialog is the shell\'s, for that role, filtered to the audio types', dialogs.length === 1 && dialogs[0].role === 'main' && dialogs[0].title === 'Custom sample: Main beat'
+      && JSON.stringify(dialogs[0].filters) === JSON.stringify([{ name: 'Audio', extensions: EXTS }]) && ['wav', 'aif', 'aiff', 'mp3', 'm4a', 'aac', 'flac', 'ogg', 'opus'].every(x => EXTS.includes(x)), JSON.stringify(dialogs[0]));
+    check('samples: the choice is stored with the metronome settings (file name only)', JSON.stringify((await metroStore()).samples) === '{"main":{"name":"My Click.wav"}}', JSON.stringify((await metroStore()).samples));
+    check('samples: the row shows "Custom", the file name and Reset', await js('(() => { const r = document.querySelector(\'[data-fk="set-snd-main"]\'); return r.querySelector("select").value === "custom" && r.querySelector(\'[data-fk="set-file-main"]\').textContent === "My Click.wav" && r.querySelector(\'[data-fk="set-reset-main"]\').textContent === "Reset"; })()'));
+    check('samples: no toast for a sample under 2 s', !/trimmed/.test(await toastNow()), await toastNow());
+    check('samples: decoded once into an AudioBuffer (0.25 s, mono)', await js('(() => { const b = __metro.samples.buffers.main; return b instanceof AudioBuffer && Math.abs(b.duration - 0.25) < 0.002 && b.numberOfChannels === 1; })()'));
+    check('samples: main and soft beats use it, accents and subdivisions keep their built-in sound', await M('m.soundFor("normal").buffer === m.samples.buffers.main && m.soundFor("soft").buffer === m.samples.buffers.main && m.soundFor("normal").id === "sample" && m.soundFor("accent").id === "click" && m.soundFor("sub").id === "click"'));
+    await js('__plays.length = 0');
+    await click('[data-fk="set-play-main"]');
+    await checkSoon('samples: ▶ plays the sample at the main level and the volume', () => js('__plays.some(p => p.buffer === __metro.samples.buffers.main && Math.abs(p.gain - __metro.state.volume * __metro.state.levels.main) < 1e-6)'), () => js('JSON.stringify(__plays.map(p => p.gain))'));
+
+    // Subdivision too; a long stereo file for the accent is cut to its first 2 s, with a toast, and mixed to mono.
+    await choose('sub', source('Sub Tick.wav', wavBytes(0.1)));
+    const longHit = wavBytes(3, 2, 48000, (_i, c) => (c ? -8192 : 16384));   // left +0.5, right −0.25
+    await choose('accent', source('Long Hit.wav', longHit));
+    await checkSoon('samples: a 3 s file is trimmed to 2 s, and says so', async () => (await toastNow()) === '“Long Hit.wav” is trimmed to its first 2 seconds.', toastNow);
+    check('samples: stereo is mixed to mono by averaging, not normalised (+0.5 and −0.25 → +0.125), faded out where cut',
+      await js('(() => { const b = __metro.samples.buffers.accent, d = b.getChannelData(0); return b.numberOfChannels === 1 && b.length === 96000 && Math.abs(d[1000] - 0.125) < 1e-3 && Math.abs(d[95999]) < 1e-3 && d[95700] > 0.12; })()'),
+      await js('(() => { const b = __metro.samples.buffers.accent, d = b.getChannelData(0); return b.numberOfChannels + " ch, " + b.length + ", " + d[1000] + " … " + d[95999]; })()'));
+    check('samples: the copy is the whole file', fs.readFileSync(path.join(sdir, 'accent.wav')).equals(longHit), stored());
+    await js('document.querySelector(\'[data-fk="set-snd-sub"]\').scrollIntoView({ block: "center" })');
+    await shot('metro-samples-settings');
+    // Picking a built-in sound while a sample is set drops the sample (and its copy).
+    await setSel('set-sound-accent', 'beep');
+    await checkSoon('samples: choosing a built-in sound instead deletes the copy', async () => stored() === 'main.wav,sub.wav' && await js('!__metro.samples.buffers.accent && __metro.state.sounds.accent === "beep" && !__metro.state.samples.accent && !document.querySelector(\'[data-fk="set-reset-accent"]\')'), stored);
+    await setSel('set-sound-accent', 'click');
+    await closeSet();
+
+    // The scheduler plays the samples like the built-ins: same times, the role's level times the volume.
+    await js('Object.assign(__metro.state.levels, { accent: 1, main: 0.5, sub: 0.25 }); __metro.state.adv = __metro.normSetup({ beats: 4, pattern: ["accent", "normal", "soft", "normal"], sub: 2 }); __metro.setBpm(240)');
+    await js('document.activeElement.blur()');
+    await key('n'); await waitFor('__metro.state.open');
+    await click('[data-fk="metro-mode-advanced"]');
+    await js('__plays.length = 0; __cuts.length = 0');
+    await key(' ');
+    await waitFor(() => M('s.scheduled.filter(e => e.role === "soft").length >= 2 && s.scheduled.filter(e => e.role === "sub").length >= 8'));
+    await key(' '); await waitFor('!__metro.state.running');
+    const run = await js(`(() => {
+      const B = __metro.samples.buffers, v = __metro.state.volume, ev = __metro.state.scheduled.slice(), plays = __plays.slice();
+      const want = { normal: [B.main, v * 0.5], soft: [B.main, v * 0.5 * 0.45], sub: [B.sub, v * 0.25 * 0.5] };
+      const bad = [];
+      for (const e of ev) {
+        if (e.role === 'accent') { if (e.sound !== 'click') bad.push('accent ' + e.sound); continue; }
+        const [buf, gain] = want[e.role];
+        const p = plays.filter(p => p.buffer === buf && Math.abs(p.at - e.at) < 1e-6);
+        if (e.sound !== 'sample' || p.length !== 1 || Math.abs(p[0].gain - gain) > 1e-6) bad.push(e.role + '@' + e.at + ' ' + e.sound + ' ' + p.map(x => x.gain));
+      }
+      return { n: ev.length, bad };
+    })()`);
+    check('samples: every main, soft and sub event starts its sample exactly at the scheduled time, at level × volume (soft quieter)', run.n >= 12 && run.bad.length === 0, JSON.stringify(run).slice(0, 300));
+    const cuts = await js(`(() => {
+      const ev = __metro.state.scheduled.filter(e => e.gain > 0), plays = __plays.slice(), bad = [];
+      ev.slice(0, -1).forEach((e, i) => {
+        const want = ev[i + 1].at + 0.005;
+        if (Math.abs((e.cut || 0) - want) > 1e-9) bad.push(e.role + '@' + e.at + ' cut ' + e.cut);
+        if (!__cuts.some(t => Math.abs(t - want) < 1e-9)) bad.push('no fade to 0 at ' + want);
+        const p = plays.find(p => Math.abs(p.at - e.at) < 1e-9 && p.buffer && p.buffer.length > 4000);
+        if (e.sound === 'sample' && (!p || Math.abs(p.stop - want) > 1e-9)) bad.push(e.role + '@' + e.at + ' stop ' + (p && p.stop));
+      });
+      return { n: ev.length, bad };
+    })()`);
+    check('samples: each click, sample or built-in, is cut where the next one starts (5 ms fade; a sample stops there)', cuts.n >= 12 && cuts.bad.length === 0, JSON.stringify(cuts).slice(0, 300));
+    await js('Object.assign(__metro.state.levels, { accent: 1, main: 1, sub: 1 }); __metro.state.adv = __metro.normSetup({}); __metro.setBpm(100)');
+    await click('[data-fk="metro-mode-simple"]');
+    await key('Escape'); await waitFor('!__metro.state.open');
+
+    // Re-picking replaces the copy (an AIFF now: Chromium can't decode it, the page reads it itself).
+    await openSet();
+    await choose('main', source('Clave.aiff', aiffBytes(0.2)));
+    await checkSoon('samples: re-picking overwrites the role\'s copy (main.wav → main.aiff)', async () => stored() === 'main.aiff,sub.wav' && (await js('__metro.state.samples.main.name')) === 'Clave.aiff', stored);
+    check('samples: uncompressed AIFF is read (0.2 s at 44.1 kHz, first samples exact)', await js('(() => { const b = __metro.samples.buffers.main, d = b.getChannelData(0); return b.sampleRate === 44100 && b.length === 8820 && Math.abs(d[0] + 16000 / 32768) < 1e-6 && Math.abs(d[1] + 15990 / 32768) < 1e-6; })()'),
+      await js('(() => { const b = __metro.samples.buffers.main; return b && b.sampleRate + " " + b.length + " " + b.getChannelData(0)[0]; })()'));
+    // Rejected files change nothing.
+    const unchanged = async () => stored() === 'main.aiff,sub.wav' && await js('__metro.state.samples.main.name === "Clave.aiff" && __metro.samples.buffers.main.length === 8820 && document.querySelector(\'[data-fk="set-sound-main"]\').value === "custom"');
+    await js('__toasts.length = 0');
+    await choose('main', source('not-audio.mp3', Buffer.from('these are notes, not audio\n'.repeat(40))));
+    await checkSoon('samples: a file that isn\'t audio is refused, the reason in a line under the rows', async () => (await refusal()) === '“not-audio.mp3” isn’t audio the metronome can play.', refusal);
+    check('samples: … not as a toast, and the current sample stays', await unchanged() && (await js('__toasts.length')) === 0, stored());
+    await js('document.querySelector(\'[data-fk="set-sound-msg"]\').scrollIntoView({ block: "center" })');
+    await shot('metro-samples-refused');
+    const huge = source('huge.wav', Buffer.concat([wavBytes(0.1), Buffer.alloc(MAX_BYTES)]));
+    await choose('main', huge);
+    await checkSoon('samples: a file over 5 MB is refused with its reason', async () => (await refusal()) === '“huge.wav” is larger than 5 MB.', refusal);
+    check('samples: … before it is read, and the current sample stays', MAX_BYTES === 5 * 1024 * 1024 && fs.statSync(huge).size > MAX_BYTES && await unchanged() && (await js('__toasts.length')) === 0, stored());
+    await choose('main', null);
+    check('samples: cancelling the dialog changes nothing, quietly', await unchanged() && (await js('__toasts.length')) === 0);
+    // Reset: back to the built-in sound, the copy deleted.
+    await click('[data-fk="set-reset-main"]');
+    await checkSoon('samples: Reset returns Main beat to its built-in sound and deletes the copy (and clears the refusal line)', async () => stored() === 'sub.wav' && await M('!s.samples.main && !m.samples.buffers.main && m.soundFor("normal").id === "click"') && !(await refusal())
+      && await js('document.querySelector(\'[data-fk="set-sound-main"]\').value === "click" && !document.querySelector(\'[data-fk="set-file-main"]\')'), stored);
+
+    // The shell side only takes a known role and operation; the page never names a path.
+    const guards = [await shell.handle('pick', '../../etc/passwd'), await shell.handle('load', 'main/../../x'), await shell.handle('read', 'main'), await shell.handle('save', 'main')];
+    check('samples: the shell refuses unknown roles and operations, and a save without a pick', guards.map(g => g.error).join() === 'role,role,op,nothing' && dialogs.every(d => ['accent', 'main', 'sub'].includes(d.role)), JSON.stringify(guards));
+
+    // The copy survives the original moving away.
+    await choose('main', clickSrc);
+    await waitFor(async () => stored() === 'main.wav,sub.wav');
+    await closeSet();
+    fs.rmSync(srcDir, { recursive: true, force: true });
+    await reloadPage(); await instrument();
+    const lost0 = await connectShell();
+    check('samples: at launch the copies are decoded (the originals are gone), no toast', lost0.length === 0 && (await js('__toasts.length')) === 0 && await M('m.samples.buffers.main.length === 12000 && m.samples.buffers.sub instanceof AudioBuffer && m.soundFor("normal").id === "sample"'), JSON.stringify(lost0));
+
+    // Missing or broken copies at launch: the built-in sound, one quiet toast, and the setting goes back.
+    fs.rmSync(path.join(sdir, 'main.wav'));
+    fs.writeFileSync(path.join(sdir, 'sub.wav'), 'not a wave');
+    await reloadPage(); await instrument();
+    const lost = await connectShell();
+    check('samples: a missing and an unreadable copy at launch fall back to the built-in sounds', lost.join() === 'main,sub' && await M('m.soundFor("normal").id === "click" && m.soundFor("sub").id === "click" && Object.keys(s.samples).length === 0') && JSON.stringify((await metroStore()).samples) === '{}', JSON.stringify(lost));
+    await waitFor('__toasts.length > 0');
+    check('samples: … with one toast', (await js('__toasts.length')) === 1 && (await js('__toasts[0]')) === 'Couldn’t load the custom metronome sounds for Main beat and Subdivision; using the built-in ones.', await js('JSON.stringify(__toasts)'));
+    check('samples: … and the broken copy is deleted', stored() === '', stored());
+    await reloadPage(); await instrument();
+    check('samples: the next launch is quiet', (await connectShell()).length === 0 && (await js('__toasts.length')) === 0);
+
+    pumping = false; await Promise.race([pump, sleep(3000)]);
+    await js('delete window.__sb');
+    for (const d of [sdir, srcDir]) fs.rmSync(d, { recursive: true, force: true });
+  }
 
   // the Dock / window icon, rendered the way the shell does it
   const { renderAccentIcon } = require('../src/accent-icon');
@@ -1738,6 +2358,8 @@ async function run() {
   // ---------------------------------------------------------------- Settings → Device, capture info
   // Bodies from the phone-app trace 2026-10-09 (docs/INVESTIGATION.md §11).
   const BRIGHT_153 = '0E C0 08 01 20 99 01 75 00 00 C0 C0 43 00 00 00';   // 67 {1:1 4:153 14:-6.0}
+  const MUTE_INPUT_ON = '08 C0 08 01 60 01 43 00 00 00';                    // 67 {1:1 12:1} → 66.15
+  const MUTE_OUTPUT_ON = '08 C0 08 01 68 01 43 00 00 00';                   // 67 {1:1 13:1} → 66.16
   const val = (fk) => js(`document.querySelector('[data-fk="${fk}"]')?.textContent || ''`);
   await js('document.activeElement.blur()');
   n0 = await mark();
@@ -1754,7 +2376,8 @@ async function run() {
   await checkSoon('Device: LED brightness reads 153 = 60 %, USB playback −6.0 dB', () => js('document.querySelector(\'[data-fk="dev-brightness"]\').value === "153" && document.querySelector(\'[data-fk="dev-brightness"]\').nextElementSibling.textContent === "60%" && document.querySelector(\'[data-fk="dev-usb-num"]\').value === "-6.0"'));
   check('Device: Raw settings is collapsed and lists the 66 fields', await js('(() => { const d = document.querySelector(\'[data-fk="dev-raw"]\'); return !d.open && /6=153/.test(d.textContent) && /17=-6(?![\\d.])/.test(d.textContent) && /13=129/.test(d.textContent); })()'), await js('document.querySelector(\'[data-fk="dev-raw"]\').textContent'));
   check('Device: no stray text above About', (await js('document.querySelector(".dev-page").firstChild.tagName')) === 'SECTION');
-  check('Device: only brightness and USB volume are editable', (await js('document.querySelectorAll(".dev-page input").length')) === 3);
+  check('Device: monitoring readback starts unmuted', await js('__dev.settings.muteInput === false && __dev.settings.muteOutput === false && document.querySelector(\'[data-fk="dev-mute-input"]\').getAttribute("aria-checked") === "false" && document.querySelector(\'[data-fk="dev-mute-output"]\').getAttribute("aria-checked") === "false"'));
+  check('Device: brightness, USB volume and monitoring switches are editable', (await js('document.querySelectorAll(".dev-page input").length')) === 3 && await js('document.querySelectorAll(".dev-page [role=switch]").length === 2 && document.querySelector(\'[data-fk="dev-mute-input"]\').textContent === "Mute Input" && document.querySelector(\'[data-fk="dev-mute-output"]\').textContent === "Mute Outputs 1L/2R"'));
   await shot('xx-device');
   // brightness by keyboard: one step up and back to 153
   await js('document.querySelector(\'[data-fk="dev-brightness"]\').focus()');
@@ -1789,6 +2412,35 @@ async function run() {
   sent = await txWait(n0, tx => tx.length >= 3);
   check('Read again re-sends 65, 46 and the keep-alive 91', sent.length === 3 && /Read device settings/.test(sent[0]) && /Read device info/.test(sent[1]) && /Keep-alive: 06 C0 08 03 5B 00 00 00$/.test(sent[2]), JSON.stringify(sent));
   await checkSoon('the read-back shows the stored values (153, −11.0 dB)', () => js('document.querySelector(\'[data-fk="dev-brightness"]\').value === "153" && document.querySelector(\'[data-fk="dev-usb-num"]\').value === "-11.0"'));
+
+  // Monitoring: one-field writes, ACK-triggered readback, external updates and rapid stale reports.
+  await js('state.presetDirty = false; render()'); await frame();
+  n0 = await mark();
+  await click('[data-fk="dev-mute-input"]');
+  sent = await txWait(n0, tx => tx.some(t => t.endsWith(': ' + MUTE_INPUT_ON)));
+  check('Mute Input writes only field 12 with an explicit 1', sent.some(t => t.endsWith(': ' + MUTE_INPUT_ON)) && sent.some(t => /^TX Device monitoring: Mute Input ON/.test(t)), JSON.stringify(sent));
+  check('Mute Input ACK is logged and does not dirty the preset', await js('__ui.logs.some(l => /Device settings confirmed/.test(l.text)) && state.presetDirty === false'), await js('JSON.stringify({ dirty: state.presetDirty, value: __dev.settings.muteInput })'));
+  await checkSoon('Mute Input readback updates the switch', () => js('__dev.settings.muteInput === true && document.querySelector(\'[data-fk="dev-mute-input"]\').getAttribute("aria-checked") === "true"'));
+  n0 = await mark();
+  await click('[data-fk="dev-mute-output"]');
+  sent = await txWait(n0, tx => tx.some(t => t.endsWith(': ' + MUTE_OUTPUT_ON)));
+  check('Mute Outputs 1L/2R writes only field 13 with an explicit 1', sent.some(t => t.endsWith(': ' + MUTE_OUTPUT_ON)) && sent.some(t => /^TX Device monitoring: Mute Outputs 1L\/2R ON/.test(t)), JSON.stringify(sent));
+  await checkSoon('Mute Outputs 1L/2R readback updates the switch without dirty state', () => js('__dev.settings.muteOutput === true && document.querySelector(\'[data-fk="dev-mute-output"]\').getAttribute("aria-checked") === "true" && state.presetDirty === false'));
+  n0 = await mark();
+  await click('[data-fk="dev-mute-output"]');
+  sent = await txWait(n0, tx => tx.some(t => t.endsWith(': 08 C0 08 01 68 00 43 00 00 00')));
+  check('Mute Outputs 1L/2R writes an explicit 0 when turned off', sent.some(t => t.endsWith(': 08 C0 08 01 68 00 43 00 00 00')), JSON.stringify(sent));
+
+  // An unsolicited type-66 report is authoritative when no local write is pending.
+  await js('__devDemo.store.muteInput = false; __devDemo.store.muteOutput = false; __devDemo.emitSettings(); 0');
+  await checkSoon('external monitoring updates apply to both switches', () => js('__dev.settings.muteInput === false && __dev.settings.muteOutput === false && document.querySelector(\'[data-fk="dev-mute-input"]\').getAttribute("aria-checked") === "false" && document.querySelector(\'[data-fk="dev-mute-output"]\').getAttribute("aria-checked") === "false"'));
+
+  // Two clicks and an older incoming report occur synchronously; the stale report must not block or undo the latest click.
+  n0 = await mark();
+  await js('(() => { const b = document.querySelector(\'[data-fk="dev-mute-input"]\'); b.click(); __devDemo.store.muteInput = false; __devDemo.emitSettings(); document.querySelector(\'[data-fk="dev-mute-input"]\').click(); })()');
+  sent = await txWait(n0, tx => tx.filter(t => /^TX Device monitoring: Mute Input /.test(t)).length >= 2);
+  check('rapid Mute Input toggles stay responsive and preserve the latest value', sent.filter(t => /^TX Device monitoring: Mute Input /.test(t)).length === 2 && sent.some(t => t.endsWith(': ' + MUTE_INPUT_ON)) && sent.some(t => t.endsWith(': 08 C0 08 01 60 00 43 00 00 00')) && await js('__dev.settings.muteInput === false && document.querySelector(\'[data-fk="dev-mute-input"]\').getAttribute("aria-checked") === "false"'), JSON.stringify(sent));
+
   await click('[data-fk="dev-usb-num"]');
   n0 = await txCount();
   await key('a', [MOD]); await type('-6'); await key('Return'); await txWait(n0);
@@ -1843,6 +2495,92 @@ async function run() {
   await shot('xx-capture-info');
   await key('Escape');
   await checkSoon('Esc closes capture info', '!document.querySelector(".cap-info")');
+  // Slot 2 answers "null" for its description, as a real pedal does for a capture without one: nothing is shown.
+  await rightClick('[data-fk="capslot-2"]');
+  await js(ctxItem('Info') + '.click()');
+  await waitFor('!!document.querySelector(\'[data-fk="cap-author"]\') && !!document.querySelector(\'[data-fk="cap-tags"] .chip\')');
+  check('a capture whose description is "null" shows no description (no empty paragraph either)', await js('!document.querySelector(\'[data-fk="cap-desc"]\') && ![...document.querySelectorAll(".cap-info p")].some(p => /null/i.test(p.textContent) || !p.textContent.trim()) && !/null/i.test(document.querySelector(".cap-info").textContent)'), await js('document.querySelector(".cap-info")?.textContent'));
+  await key('Escape'); await waitFor('!document.querySelector(".cap-info")');
+  // Slot 4 answers an empty description, like the traced pedal reply: no "null" either (the panel used to make one).
+  await rightClick('[data-fk="capslot-4"]');
+  await js(ctxItem('Info') + '.click()');
+  await waitFor('!!document.querySelector(\'[data-fk="cap-author"]\') && !!document.querySelector(\'[data-fk="cap-tags"] .chip\')');
+  check('a capture with an empty description shows no description and no stray "null"', await js('!document.querySelector(\'[data-fk="cap-desc"]\') && !/null/i.test(document.querySelector(".cap-info").textContent) && [...document.querySelector(".cap-body").childNodes].every(n => n.nodeType === 1)'), await js('document.querySelector(".cap-info")?.textContent'));
+  await key('Escape'); await waitFor('!document.querySelector(".cap-info")');
+  // Slot 5's description is just a Cortex Cloud product ID, as some captures on a real pedal have ("Darkglass
+  // MT900V2 1", 2026-10-24). No bare ID is shown; in the desktop app "Open in Cortex Cloud" takes its place.
+  const DEMO_CLOUD_ID = '5d3e0c10-0d00-4a11-8c55-0000000000a5';
+  const openInfo = async (slot) => {
+    await rightClick(`[data-fk="capslot-${slot}"]`);
+    await js(ctxItem('Info') + '.click()');
+    await waitFor('!!document.querySelector(\'[data-fk="cap-author"]\') && !!document.querySelector(\'[data-fk="cap-tags"] .chip\')');
+    await stable('JSON.stringify(document.querySelector(".pop.cap-info")?.getBoundingClientRect())');
+  };
+  const cloudOf = (v) => js(`NanoText.captureCloudId(${JSON.stringify(v)})`);
+  const NT = require('../pro/capture-text');
+  check('captureCloudId: the whole (trimmed) description must be one UUID; returned in lowercase',
+    (await cloudOf(' 4CD7F0D5-B0E2-4C8C-AA79-A9B856D71CF5 ')) === '4cd7f0d5-b0e2-4c8c-aa79-a9b856d71cf5' && (await cloudOf('4cd7f0d5-b0e2-4c8c-aa79-a9b856d71cf5')) === '4cd7f0d5-b0e2-4c8c-aa79-a9b856d71cf5'
+    && (await cloudOf('See 4cd7f0d5-b0e2-4c8c-aa79-a9b856d71cf5')) === null && (await cloudOf('4cd7f0d5-b0e2-4c8c-aa79-a9b856d71cf5 4cd7f0d5-b0e2-4c8c-aa79-a9b856d71cf5')) === null
+    && (await cloudOf('4cd7f0d5b0e24c8caa79a9b856d71cf5')) === null && (await cloudOf('4cd7f0d5-b0e2-4c8c-aa79-a9b856d71cf')) === null && (await cloudOf('zcd7f0d5-b0e2-4c8c-aa79-a9b856d71cf5')) === null
+    && (await cloudOf('')) === null && (await cloudOf(null)) === null && (await cloudOf('null')) === null && NT.captureCloudId('4CD7F0D5-B0E2-4C8C-AA79-A9B856D71CF5') === '4cd7f0d5-b0e2-4c8c-aa79-a9b856d71cf5');
+  const shownOf = (v) => js(`NanoText.captureDescription(${JSON.stringify(v)})`);
+  check('a description that is a bare Cloud ID counts as no description (shown, searched); a real text with an ID in it is kept',
+    (await shownOf(' 4cd7f0d5-b0e2-4c8c-aa79-a9b856d71cf5 ')) === '' && (await shownOf('From 4cd7f0d5-b0e2-4c8c-aa79-a9b856d71cf5')) === 'From 4cd7f0d5-b0e2-4c8c-aa79-a9b856d71cf5' && NT.captureDescription('4CD7F0D5-B0E2-4C8C-AA79-A9B856D71CF5') === '');
+  check('… but it is still stored and sent as it is: a capture record keeps its Cloud ID as field 5 (only "null" and blanks go out empty)', await js(`(() => { const m = { hash: 'ab', name: 'N', cloudUUID: 'u', authorId: 'a', authorName: 'b', deviceType: 'pedal', tags: [], instrumentType: 'guitar', version: '1' };
+    return new TextDecoder().decode(Uint8Array.from(NanoTransfer.captureRecord({ ...m, description: '4CD7F0D5-B0E2-4C8C-AA79-A9B856D71CF5' }))).includes('4CD7F0D5-B0E2-4C8C-AA79-A9B856D71CF5'); })()`) && NT.storedDescription(' NULL ') === '' && NT.storedDescription('4cd7f0d5-b0e2-4c8c-aa79-a9b856d71cf5') === '4cd7f0d5-b0e2-4c8c-aa79-a9b856d71cf5');
+  await openInfo(5);
+  check('without the desktop shell (the web preview) a Cloud-ID description shows nothing: no ID, no button', await js(`!document.querySelector('[data-fk="cap-desc"]') && !document.querySelector('[data-fk="cap-cloud-link"]') && !/${DEMO_CLOUD_ID}/i.test(document.querySelector(".cap-info").textContent)`), await js('document.querySelector(".cap-info")?.textContent'));
+  await key('Escape'); await waitFor('!document.querySelector(".cap-info")');
+  // The desktop app's opener (nanoShell.openCloudCapture → main), recorded here instead.
+  await js('window.__cloudOpened = []; __setCloudCaptureOpener((id) => { __cloudOpened.push(id); return Promise.resolve(true); }); 0');
+  await openInfo(5);
+  const cloudBtn = await js(`(() => { const b = document.querySelector('[data-fk="cap-cloud-link"]'); if (!b) return null; const by = document.querySelector('[data-fk="cap-author"]').getBoundingClientRect();
+    const r = document.createRange(); r.selectNodeContents(b); const t = r.getBoundingClientRect(), s = getComputedStyle(b);
+    return { text: b.textContent, cls: b.className, tag: b.tagName, title: b.title, textLeft: Math.round(t.left), byLeft: Math.round(by.left), size: s.fontSize, bg: s.backgroundColor, color: s.color,
+      dim: getComputedStyle(document.documentElement).getPropertyValue('--dim').trim(), panelText: document.querySelector('.cap-info').textContent, desc: !!document.querySelector('[data-fk="cap-desc"]'),
+      afterTags: !!b.previousElementSibling && b.previousElementSibling.matches('[data-fk="cap-tags"]') }; })()`);
+  check('a capture whose description is its Cloud ID: Info shows "Open in Cortex Cloud" where the description would be (a small ghost button, no ID)',
+    !!cloudBtn && cloudBtn.text === 'Open in Cortex Cloud' && cloudBtn.tag === 'BUTTON' && /\bbtn\b/.test(cloudBtn.cls) && /\bghost\b/.test(cloudBtn.cls) && /\bsmall\b/.test(cloudBtn.cls) && !cloudBtn.desc && cloudBtn.afterTags
+    && !new RegExp(DEMO_CLOUD_ID, 'i').test(cloudBtn.panelText) && cloudBtn.size === '12px' && cloudBtn.bg === 'rgba(0, 0, 0, 0)' && cloudBtn.title === 'Open this capture\u2019s page in the Cortex Cloud tab', JSON.stringify(cloudBtn));
+  check('… link-style: its text lines up with "by …" above it', !!cloudBtn && Math.abs(cloudBtn.textLeft - cloudBtn.byLeft) <= 1, JSON.stringify(cloudBtn && [cloudBtn.textLeft, cloudBtn.byLeft]));
+  await shot('xx-capture-info-cloud');
+  {
+    const r = await js('(() => { const b = document.querySelector(".pop.cap-info").getBoundingClientRect(); return { x: Math.floor(b.left) - 12, y: Math.floor(b.top) - 12, width: Math.ceil(b.width) + 24, height: Math.ceil(b.height) + 24 }; })()');
+    fs.writeFileSync(path.join(OUT, 'xx-capture-info-cloud-panel.png'), (await wc.capturePage(r)).toPNG());
+  }
+  n0 = await mark();
+  await click('[data-fk="cap-cloud-link"]');
+  await checkSoon('clicking it asks the shell to open exactly that capture (lowercase ID) and closes Info', async () => JSON.stringify(await js('__cloudOpened')) === JSON.stringify([DEMO_CLOUD_ID]) && await js('!document.querySelector(".cap-info")'), async () => JSON.stringify(await js('__cloudOpened')));
+  await settle();
+  check('… and nothing is sent to the pedal', (await txSince(n0)).length === 0, JSON.stringify(await txSince(n0)));
+  await openInfo(1);
+  check('a capture with a real description keeps it and has no Cloud button', /slot 1/.test(await val('cap-desc')) && await js('!document.querySelector(\'[data-fk="cap-cloud-link"]\')'));
+  {
+    // The description comes from the reply (18.8), else from the capture record it carries (field 5), as in the native
+    // edition: a Cloud ID in the record counts the same.
+    const ID = '4cd7f0d5-b0e2-4c8c-aa79-a9b856d71cf5';
+    const recBytes = [0x0A, 0x02, ...utf8('ab'), 0x12, 0x09, ...utf8('Darkglass'), 0x2A, 36, ...utf8(ID.toUpperCase())];
+    const reply = (desc) => frameHex([0x08, 0x06, 0x18, 0x01, ...(desc === null ? [] : [0x42, utf8(desc).length, ...utf8(desc)]), 0x52, 0x09, ...utf8('Darkglass'), 0x5A, recBytes.length, ...recBytes], 18);
+    const details = (h) => js(`(() => { let got = null; __dev.capWait = (i) => { got = i; }; const b = Uint8Array.from(${JSON.stringify(h)}.split(' ').map(x => parseInt(x, 16))); onC305({ target: { value: { buffer: b.buffer } } }); return got; })()`);
+    const viaNull = await details(reply('null')), viaNone = await details(reply(null)), viaText = await details(reply('Tight and dry'));
+    check('Info: 18.8 "null" or missing → the record\'s field 5; a Cloud ID there gives "Open in Cortex Cloud" too; a real 18.8 wins',
+      !!viaNull && viaNull.description === '' && viaNull.cloudId === ID && !!viaNone && viaNone.cloudId === ID && !!viaText && viaText.description === 'Tight and dry' && viaText.cloudId === null,
+      JSON.stringify([viaNull && [viaNull.description, viaNull.cloudId], viaNone && viaNone.cloudId, viaText && [viaText.description, viaText.cloudId]]));
+  }
+  await key('Escape'); await waitFor('!document.querySelector(".cap-info")');
+  await js('__setCloudCaptureOpener(null); delete window.__cloudOpened; 0');
+  // Library rows (the Cab / IR inspector's list): a description that is only a Cloud ID is neither shown nor searched.
+  await click('[data-fk="node-cab"]');
+  await js(`state.library.irUser.push({ index: 99, name: 'Cloud ID IR', description: '${DEMO_CLOUD_ID.toUpperCase()}' }); render()`);
+  const idRow = await waitFor(() => js(`(() => { const r = [...document.querySelectorAll('.cab-library-section .library-row')].find(x => x.textContent.includes('Cloud ID IR')); return r ? { search: r.dataset.search, text: r.textContent, title: r.title || '', titles: [...r.querySelectorAll('[title]')].map(e => e.title).join(' ') } : null; })()`));
+  check('a library row whose description is a bare Cloud ID: no ID in its detail line, tooltip or search text', !!idRow && !new RegExp(DEMO_CLOUD_ID, 'i').test(idRow.search + ' ' + idRow.text + ' ' + idRow.title + ' ' + idRow.titles) && /cloud id ir/.test(idRow.search), JSON.stringify(idRow));
+  await js(`state.library.irUser = state.library.irUser.filter(x => x.index !== 99); render()`); await frame();
+  await click('[data-fk="node-capture"]');
+  const descOf = (v) => js(`NanoText.captureDescription(${JSON.stringify(v)})`);
+  check('a description of "null" (any case), blanks or nothing counts as none; real text is kept', (await descOf('null')) === '' && (await descOf(' NULL ')) === '' && (await descOf('Null')) === '' && (await descOf('   ')) === '' && (await descOf(null)) === '' && (await js('NanoText.captureDescription(undefined)')) === '' && (await descOf('Not null at all')) === 'Not null at all' && require('../pro/capture-text').captureDescription(' null ') === '');
+  check('sending a capture never writes "null" as its description (field 5 goes out empty)', await js(`(() => { const m = { hash: 'ab', name: 'N', cloudUUID: 'u', authorId: 'a', authorName: 'b', deviceType: 'pedal', tags: [], instrumentType: 'guitar', version: '1' };
+    const a = NanoTransfer.captureRecord({ ...m, description: 'null' }), b = NanoTransfer.captureRecord({ ...m, description: '' }), c = NanoTransfer.captureRecord({ ...m, description: 'Warm' });
+    return JSON.stringify(a) === JSON.stringify(b) && !new TextDecoder().decode(Uint8Array.from(a)).includes('null') && new TextDecoder().decode(Uint8Array.from(c)).includes('Warm'); })()`));
   const curSlot = await js('state.capture.selectedSlot');
   await rightClick('[data-fk="node-capture"]');
   n0 = await mark();
@@ -1886,6 +2624,185 @@ async function run() {
   check('⌘L does nothing again', await js('!__ui.drawerOpen'));
   await settle();
 
+  // ---------------------------------------------------------------- unsaved-changes prompts: an edit still on its way counts
+  // The pedal's 115 comes after an edit lands. An edit write queued or in flight, or sent < 300 ms ago without a 115
+  // since, makes the switch prompt ask (the header's mark stays the pedal's).
+  await js('state.presetDirty = false; __demo.hooks.quiet115 = true; render()'); await settle();
+  check('an edit write that just went out counts as unsaved for the prompts, before any 115', await js('(() => { setAmpKnob("bass", 141); return __isDirtyForPrompt() && !state.presetDirty; })()'));
+  await sleep(450);
+  check('… and no longer once 300 ms pass without a 115 (the pedal says clean)', await js('!__isDirtyForPrompt() && !state.presetDirty'));
+  await js('__demo.hooks.writeDelay = 1500'); await frame();
+  const latencyFrom = await js('state.selectedPreset');
+  const latencyTo = latencyFrom === 1 ? 2 : 1;
+  await js('__ui.selected = "capture"; render()'); await frame();
+  await click('[data-fk="amp-bass"] .label');
+  n0 = await txCount();
+  await key('Up');
+  await click(`.preset-row[data-n="${latencyTo}"]`);
+  await checkSoon('switching right after an edit (its write still in flight) asks "Save changes to …?"', '!!document.querySelector(".modal h2") && /^Save changes to /.test(document.querySelector(".modal h2").textContent)');
+  await key('Escape');
+  await checkSoon('… Escape keeps the preset', async () => (await js('state.selectedPreset')) === latencyFrom && await js('!document.querySelector(".modal")'));
+  await js('__demo.hooks.writeDelay = 0; __demo.hooks.quiet115 = false; state.presetDirty = false; render()'); await settle();
+  await waitFor('!__isDirtyForPrompt()');   // the held write has landed and its 300 ms are over
+
+  // ---------------------------------------------------------------- preset reordering (143 → 144, then list and state read back)
+  // Real mouse input: press on a row (its name, or with `grip` its ⋮⋮ grip), move in steps, release on another row.
+  // The list is scrolled first so both rows are on screen and clear of the auto-scroll edges.
+  const rowSel = (n, part = '') => `#presetList .preset-row[data-n="${n}"]${part ? ' ' + part : ''}`;
+  const centreOf = (sel) => js(`(() => { const e = document.querySelector(${JSON.stringify(sel)}); if (!e) return null; const b = e.getBoundingClientRect(); return { x: Math.round(b.left + b.width / 2), y: Math.round(b.top + b.height / 2) }; })()`);
+  async function dragRow(from, to, { grip = false, beforeUp = null } = {}) {
+    const fit = await js(`(() => {
+      const l = document.getElementById('presetList'), a = l.querySelector('.preset-row[data-n="${from}"]'), b = l.querySelector('.preset-row[data-n="${to}"]');
+      if (!a || !b) return 'missing';
+      const lb = l.getBoundingClientRect(), ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
+      l.scrollTop += (Math.min(ra.top, rb.top) + Math.max(ra.bottom, rb.bottom)) / 2 - (lb.top + lb.bottom) / 2;
+      // Both rows whole on screen, and their centres (where the pointer goes) out of the auto-scroll edges unless the
+      // list can't scroll that way anyway.
+      const canUp = l.scrollTop > 0, canDown = l.scrollTop < l.scrollHeight - l.clientHeight - 1;
+      const rows = [a, b].map(r => r.getBoundingClientRect());
+      const ok = rows.every(r => r.top >= lb.top - 0.5 && r.bottom <= lb.bottom + 0.5 && (!canUp || r.top + r.height / 2 >= lb.top + 28) && (!canDown || r.top + r.height / 2 <= lb.bottom - 28));
+      return ok ? 'ok' : 'too far apart for the list (' + Math.round(lb.height) + ' px)';
+    })()`);
+    if (fit !== 'ok') check('drag harness: rows ' + from + ' and ' + to + ' fit on screen together', false, fit);
+    await frame();
+    const a = await centreOf(rowSel(from, grip ? '.grip' : '.t')), b = await centreOf(rowSel(to, '.t'));
+    wc.sendInputEvent({ type: 'mouseMove', x: a.x, y: a.y }); await frame();
+    wc.sendInputEvent({ type: 'mouseDown', x: a.x, y: a.y, button: 'left', clickCount: 1 });
+    const steps = 10;
+    for (let k = 1; k <= steps; k++) {
+      wc.sendInputEvent({ type: 'mouseMove', x: Math.round(a.x + (b.x - a.x) * k / steps), y: Math.round(a.y + (b.y - a.y) * k / steps), button: 'left' });
+      await sleep(12);
+    }
+    await frame();
+    if (beforeUp) await beforeUp(b);
+    wc.sendInputEvent({ type: 'mouseUp', x: b.x, y: b.y, button: 'left', clickCount: 1 });
+    await sleep(40); await frame();
+  }
+  // Text dragged in from elsewhere (an HTML5 drop, not a press on a row).
+  const dropText = (to, text) => js(`(() => {
+    const dt = new DataTransfer(); dt.setData('text/plain', ${JSON.stringify(String(text))});
+    const dst = document.querySelector('#presetList .preset-row[data-n="${to}"]');
+    dst.dispatchEvent(new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer: dt }));
+    dst.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: dt }));
+    return true;
+  })()`);
+  const allNames = () => js('[...Array(64).keys()].map(i => state.presetNames.get(i + 1))');
+  const namesBefore = await allNames();
+  // A taller window for this section: the move back drags row 2 onto row 22 with the filter off, both on screen.
+  win.setContentSize(1400, 1000);
+  await waitFor('innerHeight === 1000'); await frame();
+  await js('document.activeElement.blur()');
+  await js('{ const f = document.getElementById("presetFilter"); f.value = ""; f.dispatchEvent(new Event("input")); f.blur(); }'); await frame();
+  // The grip: ⋮⋮ on the row under the mouse only. Rows show the arrow; the open hand only over the grip.
+  const gripInfo = (n) => js(`(() => {
+    const r = document.querySelector('#presetList .preset-row[data-n="${n}"]'), g = r && r.querySelector('.grip'), s = g && g.querySelector('svg');
+    if (!s) return null;
+    const rb = r.getBoundingClientRect(), sb = s.getBoundingClientRect(), gb = g.getBoundingClientRect();
+    return { vis: getComputedStyle(g).visibility, color: getComputedStyle(g).color, row: getComputedStyle(r).cursor, name: getComputedStyle(r.querySelector('.t')).cursor, grip: getComputedStyle(g).cursor,
+      w: Math.round(sb.width), h: Math.round(sb.height), right: Math.round(rb.right - sb.right), dy: Math.round((sb.top + sb.bottom - rb.top - rb.bottom) / 2),
+      hitW: Math.round(gb.width), hitH: Math.round(gb.height), hitRight: Math.round(rb.right - gb.right), nameRight: Math.round(rb.right - r.querySelector('.t').getBoundingClientRect().right) };
+  })()`);
+  await js(`document.getElementById('presetList').scrollTop = 0`); await frame();
+  let pt = await centreOf(rowSel(3, '.t'));
+  wc.sendInputEvent({ type: 'mouseMove', x: pt.x, y: pt.y }); await frame();
+  let gr3 = await gripInfo(3), gr4 = await gripInfo(4);
+  check('preset rows: the ⋮⋮ grip is hidden on a row the mouse is not over', gr4 && gr4.vis === 'hidden', JSON.stringify(gr4));
+  check('preset rows: the grip shows on the row under the mouse: right end (8 px in), 6 × 10, centred, faint', gr3 && gr3.vis === 'visible' && gr3.w === 6 && gr3.h === 10 && gr3.right === 8 && Math.abs(gr3.dy) <= 1 && gr3.color === 'rgb(97, 97, 97)' && gr3.nameRight === 20, JSON.stringify(gr3));
+  check('preset rows: a row shows the arrow cursor, not the pointing hand', gr3.row === 'default' && gr3.name === 'default', JSON.stringify(gr3));
+  pt = await centreOf(rowSel(3, '.grip'));
+  wc.sendInputEvent({ type: 'mouseMove', x: pt.x, y: pt.y }); await frame();
+  gr3 = await gripInfo(3);
+  check('preset rows: the grip shows the open hand (a 20 × 28 target to the row\'s edge) and brightens', gr3.grip === 'grab' && gr3.hitW === 20 && gr3.hitH === 28 && gr3.hitRight === 0 && gr3.color === 'rgb(171, 171, 171)' && (await js(`document.elementFromPoint(${pt.x}, ${pt.y}).closest('.grip') !== null`)), JSON.stringify(gr3));
+  await shot('xx-preset-grip');
+  pt = await centreOf(rowSel(3, '.t'));
+  wc.sendInputEvent({ type: 'mouseMove', x: pt.x, y: pt.y }); await frame();
+  await shot('xx-preset-grip-row');
+  // While dragging: the closed hand everywhere, the source dimmed, a copy of the row under the pointer, the target outlined.
+  n0 = await mark();
+  let during = null;
+  await dragRow(3, 6, { beforeUp: async (b) => {
+    during = await js(`({ html: document.documentElement.classList.contains('preset-dragging'), under: getComputedStyle(document.elementFromPoint(${b.x}, ${b.y})).cursor,
+      body: getComputedStyle(document.body).cursor, drag: __presetDrag(), ghost: !!document.querySelector('.preset-ghost .preset-row'),
+      src: document.querySelector('#presetList .preset-row[data-n="3"]').classList.contains('dragging'), dst: document.querySelector('#presetList .preset-row[data-n="6"]').classList.contains('drop-target'),
+      grips: [...document.querySelectorAll('#presetList .grip')].every(g => getComputedStyle(g).visibility === 'hidden') })`);
+    await key('Escape');
+  } });
+  check('dragging a preset row shows the closed hand (grabbing) all the way, with a copy of the row; the source dims, the target is outlined', during && during.html && during.under === 'grabbing' && during.body === 'grabbing' && during.drag && during.drag.active && during.drag.from === 3 && during.drag.target === 6 && during.ghost && during.src && during.dst && during.grips, JSON.stringify(during));
+  await settle();
+  check('Escape cancels a row drag: nothing sent, no preset loaded, the cursor and the styling are back', (await txSince(n0)).length === 0 && (await js('state.selectedPreset')) !== 6 && await js('!document.documentElement.classList.contains("preset-dragging") && !document.querySelector(".preset-ghost, #presetList .dragging, #presetList .drop-target") && !__presetDrag()'), JSON.stringify(await txSince(n0)));
+  // Near the list's bottom edge it scrolls (the system drag did that too); released outside the rows, nothing moves.
+  await js(`document.getElementById('presetList').scrollTop = 0`); await frame();
+  const scroll0 = await js('document.getElementById("presetList").scrollTop');
+  n0 = await mark();
+  await dragRow(2, 3, { beforeUp: async (b) => {
+    const lb = await js('(() => { const r = document.getElementById("presetList").getBoundingClientRect(); return { x: Math.round(r.left + r.width / 2), y: Math.round(r.bottom - 6) }; })()');
+    wc.sendInputEvent({ type: 'mouseMove', x: lb.x, y: lb.y, button: 'left' });
+    await waitFor(async () => (await js('document.getElementById("presetList").scrollTop')) > scroll0 + 40);
+    wc.sendInputEvent({ type: 'mouseMove', x: lb.x + 400, y: lb.y, button: 'left' });   // over the chain, off the list
+    await frame();
+    b.x = lb.x + 400; b.y = lb.y;
+  } });
+  await settle();
+  check('a row dragged to the list\'s bottom edge scrolls the list; dropped off the rows, nothing is sent', (await js('document.getElementById("presetList").scrollTop')) > scroll0 + 40 && (await txSince(n0)).length === 0 && await js('!__presetDrag() && !document.querySelector(".preset-ghost")'), String(await js('document.getElementById("presetList").scrollTop')) + ' ' + JSON.stringify(await txSince(n0)));
+  // No grip without rows (the filter matches nothing).
+  await click('#presetFilter'); await type('zzzz'); await frame();
+  check('no grip on the "No presets match" list', await js('!document.querySelector("#presetList .grip") && !!document.querySelector("#presetList .side-empty")'));
+  await js('{ const f = document.getElementById("presetFilter"); f.value = ""; f.dispatchEvent(new Event("input")); f.blur(); }'); await frame();
+  await click('#presetFilter'); await type('Lead'); await frame();
+  const leadRows = await js('[...document.querySelectorAll(".preset-row")].map(r => Number(r.dataset.n))');
+  const mvFrom = leadRows[leadRows.length - 1], mvTo = leadRows[0];
+  check('a filter is active for the drag (several rows match "Lead")', leadRows.length >= 3 && mvFrom > mvTo + 1, JSON.stringify(leadRows));
+  await click(`.preset-row[data-n="${mvFrom}"]`);
+  await checkSoon('(the preset to move is the current one)', `state.selectedPreset === ${mvFrom} && !document.querySelector(".modal")`); await settle();
+  // Text dragged in from elsewhere (not a row of this list) is ignored.
+  n0 = await mark();
+  await dropText(mvTo, mvFrom);
+  await settle();
+  check('an external text drop on a preset row sends nothing', (await txSince(n0)).length === 0, JSON.stringify(await txSince(n0)));
+  // While the slot usage scan runs, rows can't be dragged (no grip, a drag does nothing) and a move is refused.
+  await js('__ui.scanning = true; __ui.sideSig = ""; render()'); await frame();
+  n0 = await txCount();
+  let scanDrag = null;
+  await dragRow(mvFrom, mvTo, { beforeUp: async (b) => { scanDrag = await js(`({ drag: __presetDrag(), html: document.documentElement.classList.contains('preset-dragging'), grip: getComputedStyle(document.querySelector('#presetList .preset-row[data-n="${mvTo}"] .grip')).visibility })`); } });
+  const scanMove = await js(`__movePresetOrder(${mvFrom - 1}, ${mvTo - 1})`);
+  check('reordering is refused while the slot scan runs (rows not draggable, nothing sent)', scanMove === false && await js('[...document.querySelectorAll("#presetList .preset-row")].every(r => !r.classList.contains("reorderable"))') && !scanDrag.drag && !scanDrag.html && scanDrag.grip === 'hidden' && (await txSince(n0)).filter(t => /^TX Move preset/.test(t)).length === 0 && /scan/.test(await toastText()), await toastText() + ' ' + JSON.stringify(scanDrag));
+  await js('__ui.scanning = false; __ui.sideSig = ""; render()'); await frame();
+  check('rows are draggable again', await js('[...document.querySelectorAll("#presetList .preset-row")].every(r => r.classList.contains("reorderable"))'));
+  await click(`.preset-row[data-n="${mvFrom}"]`);   // the drag above loaded nothing, but make sure
+  await checkSoon('(still on the preset to move)', `state.selectedPreset === ${mvFrom} && !document.querySelector(".modal")`); await settle();
+  // The move: absolute 0-based indices even with the filter on; then the list and the state are read again.
+  n0 = await mark();
+  await dragRow(mvFrom, mvTo);
+  tx = (await txWait(n0, t => t.some(x => /^TX Current preset state request/.test(x)), { timeout: 10000 })).filter(t => /^TX (Move preset|FE metadata request|Current preset state request)/.test(t));
+  check('a real mouse drag from the row\'s name (not the grip) moves the preset: 143 goes out', tx.some(t => /^TX Move preset/.test(t)), JSON.stringify(tx));
+  check('the drop sends 143 with absolute 0-based indices (exact bytes), then reads the list and the state', tx.length >= 3 && tx[0] === `TX Move preset ${mvFrom} to position ${mvTo}: ` + frameHex([0x08, 0x04, 0x18, mvFrom - 1, 0x20, mvTo - 1], 143) && /^TX FE metadata request/.test(tx[1]) && /^TX Current preset state request/.test(tx[2]), JSON.stringify(tx));
+  await checkSoon('the moved preset is now at its new position and the others shifted by one (as the pedal listed them)', async () => {
+    const now = await allNames();
+    const want = namesBefore.slice(); const [m] = want.splice(mvFrom - 1, 1); want.splice(mvTo - 1, 0, m);
+    return JSON.stringify(now) === JSON.stringify(want);
+  }, async () => JSON.stringify((await allNames()).slice(0, 26)));
+  await checkSoon('the current preset (the one moved) is where the pedal\'s state read says: the header follows', async () => (await js('state.selectedPreset')) === mvTo && (await js('document.querySelector(".preset-title .num").textContent')) === 'Preset ' + mvTo && /^Moved preset/.test(await toastText()), async () => (await js('state.selectedPreset')) + ' ' + await toastText());
+  await settle();
+  // Moving it back (filter off), but the state read after it fails: the current preset is unknown and Save & co. stay off.
+  await js('{ const f = document.getElementById("presetFilter"); f.value = ""; f.dispatchEvent(new Event("input")); f.blur(); }'); await frame();
+  await js('__reorderTimeouts.state = 700; __reorderTimeouts.list = 4000; __demo.hooks.dropStateReads = true');
+  n0 = await mark();
+  await dragRow(mvTo, mvFrom, { grip: true });
+  tx = await txWait(n0, t => t.some(x => /^TX Move preset/.test(x)));
+  check('dragging by the ⋮⋮ grip moves a preset too', tx.some(t => t.startsWith(`TX Move preset ${mvTo} to position ${mvFrom}: `)), JSON.stringify(tx));
+  await checkSoon('a failed read after a move marks the current preset unknown (header, status bar, toast)', async () => await js('__ui.presetUnknown && document.querySelector(".preset-title .num").textContent === "Preset ?" && !document.querySelector(".preset-row.active")') && /Current preset unknown/.test(await js('document.getElementById("pcText").textContent')) && /doesn’t know which preset/.test(await toastText()), async () => (await toastText()) + ' | ' + await js('document.getElementById("pcText").textContent'));
+  check('… Save, Save as and Rename are off and Discard hidden', await js('["saveBtn", "saveAsBtn", "renameBtn"].every(id => document.getElementById(id).disabled) && document.getElementById("discardBtn").hidden'));
+  n0 = await txCount();
+  await js('state.presetDirty = true; document.activeElement.blur(); render()');
+  await key('s', [MOD]); await settle();
+  check('… and ⌘S saves nothing', !(await txSince(n0)).some(t => /^TX save preset/.test(t)));
+  await js('__demo.hooks.dropStateReads = false; __reorderTimeouts.state = 6000; __reorderTimeouts.list = 20000; state.presetDirty = false');
+  check('a successful state read clears it', (await js('NanoLive.readCurrentState(3000)')) === true && await js('!__ui.presetUnknown && !document.getElementById("saveBtn").disabled'));
+  await checkSoon('the order is back as it was', async () => JSON.stringify(await allNames()) === JSON.stringify(namesBefore) && (await js('state.selectedPreset')) === mvFrom);
+  win.setContentSize(1400, 900);
+  await waitFor('innerHeight === 900'); await frame();
+  await settle();
+
   // ---------------------------------------------------------------- disconnected / demo exit
   await click('#connectBtn');
   await checkSoon('Exit demo shows connect screen', '!document.getElementById("veil").hidden');
@@ -1915,6 +2832,122 @@ async function run() {
   check('Save disabled while disconnected', await js('document.getElementById("saveBtn").disabled'));
   await key('s', [MOD]);
   check('⌘S while disconnected explains', (await js('document.getElementById("toast").textContent')).includes('Connect'));
+  // ---------------------------------------------------------------- no stale Bluetooth link (fake pedals, no demo)
+  // 2026-10-20→23: "Disconnected" for two days while macOS still held a link to the pedal, which then stopped
+  // advertising. The page now releases the link whenever it decides it is disconnected, and before every scan. The
+  // fake pedals below stand in for Web Bluetooth device objects (the page's real connect code runs on them).
+  {
+    const addedBluetooth = await js(`(() => { if (navigator.bluetooth) return false; Object.defineProperty(navigator, 'bluetooth', { configurable: true, value: { requestDevice: () => Promise.reject(new Error('NotFoundError: no Bluetooth here')) } }); render(); return true; })()`);
+    await js(`(() => {
+      window.__bt = { seq: [], fakes: [], browserRequest: __ble.requestDevice || null };
+      window.__fakePedal = (opts = {}) => {
+        const f = { name: opts.name || 'Neural DSP Nano Cortex', disconnects: 0, writes: [], fail: '', stubborn: opts.stubborn || 0, services: opts.services !== false };
+        const listeners = new Set();
+        const c304 = { uuid: C304_UUID, writeValueWithResponse: async (b) => { if (f.fail) throw new Error(f.fail); f.writes.push(hex(b)); } };
+        const c305 = { uuid: C305_UUID, startNotifications: async () => c305, addEventListener() {}, removeEventListener() {} };
+        const service = { getCharacteristic: async (u) => { if (u === C304_UUID) return c304; if (u === C305_UUID) return c305; throw new Error('No Characteristics matching UUID ' + u); }, getCharacteristics: async () => [] };
+        const id = 'FAKE-' + (__bt.fakes.length + 1);
+        const device = {
+          id, name: f.name,
+          addEventListener: (t, fn) => { if (t === 'gattserverdisconnected') listeners.add(fn); },
+          removeEventListener: (t, fn) => { if (t === 'gattserverdisconnected') listeners.delete(fn); },
+          gatt: {
+            connected: false,
+            connect: async () => { __bt.seq.push(id + ' connect'); device.gatt.connected = true; return server; },
+            // stubborn: that many calls leave it connected (the OS holding on)
+            disconnect: () => { f.disconnects++; __bt.seq.push(id + ' disconnect'); if (f.stubborn > 0) { f.stubborn--; return; } const was = device.gatt.connected; device.gatt.connected = false; if (was) f.emit(); },
+          },
+        };
+        const server = { device, connected: true, getPrimaryService: async (u) => { if (!f.services) throw new Error('No Services matching UUID ' + u + ' found in Device.'); return service; } };
+        f.emit = () => { for (const fn of [...listeners]) fn({ type: 'gattserverdisconnected', target: device }); };
+        f.listening = () => listeners.size;
+        f.device = device; f.id = id;
+        __bt.fakes.push(f);
+        return f;
+      };
+      // The next requestDevice() returns this fake.
+      __bt.offer = (f) => { __ble.requestDevice = async () => { __bt.seq.push('requestDevice'); return f.device; }; };
+      // Nothing of it is kept: not as the page's device, not in the list of device objects to release.
+      __bt.released = (f) => !f.device.gatt.connected && state.device !== f.device && !__ble.devices.has(f.device) && f.listening() === 0 && f.disconnects > 0;
+    })()`);
+    const connectFake = async (k, opts) => {
+      await js(`window.${k} = __fakePedal(${JSON.stringify(opts || {})}); __bt.offer(${k}); 0`);
+      // The connect screen is drawn on the next frame after a disconnect (until then the old, hidden one is there).
+      await waitFor('!__ui.connecting && !state.connected && !document.getElementById("veil").hidden && !!document.querySelector(\'[data-fk="veil-connect"]\') && !document.querySelector(\'[data-fk="veil-connect"]\').disabled && document.querySelector(\'[data-fk="veil-connect"]\').getBoundingClientRect().height > 0');
+      await frame();
+      await click('[data-fk="veil-connect"]');
+    };
+    const btLog = async (n, re) => js(`__ui.logs.some(l => l.seq > ${n} && ${re}.test(l.text))`);
+    await js('__ui.connectError = ""; render()'); await frame();
+    await connectFake('fakeA');
+    await checkSoon('a fake pedal connects through the page\'s real connect code (no demo)', () => js('state.connected && !__ui.demo && state.device === fakeA.device && fakeA.device.gatt.connected'));
+
+    // (a) the link drops, but the OS still holds it: Chromium reports gattserverdisconnected while gatt.connected is true.
+    n0 = await txCount();
+    await js('fakeA.emit()');
+    await checkSoon('the link drops (gattserverdisconnected) while the OS still holds it: Disconnected, gatt.disconnect() called, no reference kept', () => js('!state.connected && __bt.released(fakeA) && state.server === null && state.c304 === null && state.c305 === null'), async () => JSON.stringify(await js('({ connected: state.connected, gatt: fakeA.device.gatt.connected, disconnects: fakeA.disconnects, kept: __ble.devices.has(fakeA.device), dev: !!state.device })')));
+    check('… the Activity log says the link was released while it was still open', await btLog(n0, '/^Bluetooth link to Neural DSP Nano Cortex released \\(it was still open\\)\\.$/'));
+
+    // (a) a write fails because the link is gone (no event came): disconnected and released.
+    await connectFake('fakeB');
+    await waitFor('state.connected && state.device === fakeB.device');
+    await settle();
+    n0 = await txCount();
+    await js(`fakeB.fail = 'NotSupportedError: GATT operation failed for unknown reason.'; writeC304('Test write', bytesFromHex('06 C0 08 03 5B 00 00 00')).then(() => { fakeB.fail = ''; }); 0`);
+    await waitFor(`__ui.logs.some(l => l.seq > ${n0} && /^ERROR: BLE write failed for "Test write"/.test(l.text))`);
+    await settle();
+    check('a write refused while the link is still up changes nothing (still connected, nothing released)', await js('state.connected && state.device === fakeB.device && fakeB.disconnects === 0 && fakeB.device.gatt.connected'));
+    n0 = await txCount();
+    await js(`fakeB.device.gatt.connected = false; fakeB.fail = 'NetworkError: GATT Server is disconnected. Cannot perform GATT operations. (Re)connect first with \`device.gatt.connect\`.'; writeC304('Test write', bytesFromHex('06 C0 08 03 5B 00 00 00')); 0`);
+    await checkSoon('a write that fails because the link is gone (no event): Disconnected, gatt.disconnect() called, no reference kept', () => js('!state.connected && __bt.released(fakeB)'));
+    check('… and says so in the Activity log, after the write error', await btLog(n0, '/^The Bluetooth link is gone \\(a write failed\\); disconnecting\\.$/') && await js(`(() => { const a = __ui.logs.find(l => l.seq > ${n0} && /^ERROR: BLE write failed/.test(l.text)), b = __ui.logs.find(l => l.seq > ${n0} && /^The Bluetooth link is gone/.test(l.text)); return !!a && !!b && a.seq < b.seq; })()`));
+    await js('fakeB.fail = ""');
+
+    // (a) an explicit Disconnect.
+    await connectFake('fakeC');
+    await waitFor('state.connected && state.device === fakeC.device');
+    await click('#connectBtn');
+    await checkSoon('Disconnect: gatt.disconnect(), Disconnected, no reference kept', () => js('!state.connected && __bt.released(fakeC)'));
+
+    // (a) a connect that fails half-way: the device has no Nano service, but its GATT link was opened.
+    await connectFake('fakeD', { services: false, name: 'JBL Flip 5' });
+    await checkSoon('a connect that fails half-way (no Nano service) leaves no link open', () => js('!state.connected && !__ui.connecting && __bt.released(fakeD)'), async () => JSON.stringify(await js('({ gatt: fakeD.device.gatt.connected, n: fakeD.disconnects, dev: state.device && state.device.id })')));
+    await js('__ui.connectError = ""; render()'); await frame();
+
+    // (b) before every requestDevice(): an older device object that still reports a connection is disconnected.
+    await connectFake('fakeE', { stubborn: 1 });
+    await waitFor('state.connected && state.device === fakeE.device');
+    n0 = await txCount();
+    await js('fakeE.emit()');
+    await waitFor('!state.connected');
+    check('a link that stays open after gatt.disconnect() (the OS holding on) is kept to be tried again, and logged', await js('fakeE.device.gatt.connected && __ble.devices.has(fakeE.device) && state.device === null && fakeE.disconnects === 1') && await btLog(n0, '/still reports a connection \\(tried again before the next scan\\)/'));
+    await js('__bt.seq.length = 0');
+    await connectFake('fakeF');
+    await waitFor('state.connected && state.device === fakeF.device');
+    const seq = await js('__bt.seq.slice()');
+    check('the next Connect disconnects it before requestDevice(), then connects the new one', seq.indexOf(await js('fakeE.id') + ' disconnect') === 0 && seq.indexOf('requestDevice') === 1 && await js('__bt.released(fakeE)'), JSON.stringify(seq));
+
+    // (c) the computer sleeps and wakes (main's powerMonitor runs these hooks).
+    n0 = await txCount();
+    check('sleep while connected: the page disconnects cleanly', (await js('__systemSuspend()')) === true && await js('!state.connected && __bt.released(fakeF)') && await btLog(n0, '/^The computer is going to sleep: disconnecting from the pedal\\.$/'));
+    // Not the launch setting: it is off here, and the wake reconnects anyway (as the native edition does after any
+    // dropped link).
+    await js('localStorage.setItem("settings.autoConnect", "false"); __bt.offer(fakeF); __bt.seq.length = 0; 0');
+    n0 = await txCount();
+    check('wake after a sleep while connected, a pedal remembered: reconnects like the launch reconnect (an auto scan), whatever "Reconnect … at launch" says', (await js('__systemResume({ pedal: true })')) === true && JSON.stringify(await js('__ble.requests.slice(-1)[0]')) === JSON.stringify({ auto: true }) && await btLog(n0, '/^The computer woke up: reconnecting to the remembered pedal\\.$/'));
+    await checkSoon('… and is connected to the pedal again', () => js('state.connected && state.device === fakeF.device && fakeF.device.gatt.connected'));
+    check('wake without having slept does nothing', (await js('__systemResume({ pedal: true })')) === false);
+    await js('__systemSuspend(); 0');
+    let requests = await js('__ble.requests.length');
+    n0 = await txCount();
+    check('wake with no remembered pedal: no scan, the Activity log says to click Connect', (await js('__systemResume({ pedal: false })')) === false && (await js('__ble.requests.length')) === requests && !(await js('state.connected')) && await btLog(n0, '/^The computer woke up\\. Click Connect to reconnect to the pedal\\.$/'));
+    check('sleep while disconnected: nothing to do, and no reconnect on wake', (await js('__systemSuspend()')) === false && (await js('__systemResume({ pedal: true })')) === false && (await js('__ble.requests.length')) === requests);
+    await js('__ble.autoWhy = "wake"; window.__bleHint = "auto-none"; log("Connect failed: NotFoundError: User cancelled the requestDevice() chooser."); __ble.autoWhy = ""; render()'); await frame();
+    check('a pedal that doesn\'t show up after wake: the connect screen says so (with the Troubleshooting link)', (await js('document.querySelector(".veil-card .err")?.textContent || ""')) === 'Your Nano Cortex didn’t show up after the computer woke up. Power it on (and close Cortex Cloud on your phone), then click Connect. Troubleshooting', await js('document.querySelector(".veil-card .err")?.textContent || ""'));
+    await js(`localStorage.removeItem("settings.autoConnect"); __ui.connectError = ""; __ble.requestDevice = __bt.browserRequest; delete window.__fakePedal; delete window.fakeA; delete window.fakeB; delete window.fakeC; delete window.fakeD; delete window.fakeE; delete window.fakeF; delete window.fakeG; ${addedBluetooth ? 'delete navigator.bluetooth;' : ''} render()`); await frame();
+    check('the fake pedals left nothing connected or remembered', await js('!state.connected && !state.device && [...__ble.devices].every(d => !d.gatt.connected) && __bt.fakes.every(f => !f.device.gatt.connected)'));
+    await js('delete window.__bt; 0');
+  }
   await click('.veil-card .btn:last-child');
   await checkSoon('demo restarts from connect screen', 'state.connected && __ui.demo');
   await settle();
@@ -2053,6 +3086,373 @@ async function run() {
   check('reconnecting: the unknown effect is reported again', (await js('document.querySelector("[data-stage=post2] .model").textContent')) === 'Unknown effect');
   await js('localStorage.removeItem("settings.firmwareWarned")');
   await loadDemo('');
+
+  // ---------------------------------------------------------------- Bluetooth chooser (issue #15)
+  // The shell's picker (src/bt-picker.js) with fake devices, its chooser drawn by this page and answered with real
+  // clicks. The test carries the messages between them, as the shell's IPC does: views to __bleChooser.show(),
+  // the page's choices (__ble.choices) and connect results (__ble.results) back to the picker.
+  {
+    const { createBluetoothPicker, sortDevices, realName } = require('../src/bt-picker');
+    const dev = (deviceId, deviceName = '') => ({ deviceId, deviceName });
+    const OTHERS = [dev('AA:01', 'JBL Flip 5'), dev('AA:02', 'Razer Nomv2X LE'), dev('AA:03', 'Bose QC45'), dev('AA:04'),
+      dev('AA:05', 'Logitech MX Keys'), dev('AA:06', 'Nanoleaf Shapes'), dev('AA:07', 'Unknown or Unsupported Device (AA:07)'),
+      dev('AA:08', 'Galaxy Buds2'), dev('AA:09', 'Sonos Roam'), dev('AA:0A', 'Cortex Speaker'), dev('AA:0B', 'Apple Watch'), dev('AA:0C')];
+    const NANO = dev('NN:01', 'Neural DSP Nano Cortex');
+    let saved = null;
+    let pageQueue = Promise.resolve();
+    const makePicker = () => {
+      const p = { again: [], hints: [], picked: [] };
+      p.picker = createBluetoothPicker({
+        store: { get: () => saved, set: (v) => { saved = v; } },
+        show: (view) => { pageQueue = pageQueue.then(() => js('__bleChooser.show(' + JSON.stringify(view) + ')')); },
+        hint: async (h) => { p.hints.push(h); }, connectAgain: (o) => p.again.push(o), chooserMs: 40, autoMs: 150,
+      });
+      p.cb = (id) => p.picked.push(id);
+      return p;
+    };
+    const synced = async () => { await pageQueue; await frame(); };
+    const toShell = async (p) => {   // the page's answers, as the preload bridge would carry them
+      for (const c of await js('__ble.choices.splice(0)')) p.picker.choose(c);
+      for (const k of await js('__ble.results.splice(0)')) p.picker.result(k);
+    };
+    const chooserUp = () => js('!!document.querySelector(".bt-chooser")');
+    const rowsText = () => js('[...document.querySelectorAll(".bt-row")].map(r => r.querySelector(".name").textContent + (r.querySelector(".tag") ? " [" + r.querySelector(".tag").textContent + "]" : "") + (r.textContent === r.querySelector(".name").textContent + (r.querySelector(".tag")?.textContent || "") ? "" : " <stray text>"))');
+    // The core's log lines when the picked device has no A002/A003 (from the issue's log).
+    const failNoService = () => js(`(() => { for (const u of ['0000a002', '0000a003']) log('Service unavailable ' + u + '-0000-1000-8000-00805f9b34fb: No Services matching UUID ' + u + '-0000-1000-8000-00805f9b34fb found in Device.');
+      log('Connect failed: C304/C305 not found under A002/A003'); })()`);
+    await js('__ble.choices.length = 0; __ble.results.length = 0');
+
+    // Order and names
+    const order = sortDevices(OTHERS.map(d => ({ id: d.deviceId, name: realName(d.deviceName, d.deviceId) })), { notNano: new Set(['AA:02']) }).map(d => d.id);
+    check('chooser order: Nano-like names, then unnamed devices, then the rest, then devices that failed the service check',
+      order.join() === 'AA:06,AA:0A,AA:04,AA:07,AA:0C,AA:01,AA:03,AA:05,AA:08,AA:09,AA:0B,AA:02', order.join());
+    check('a name made from the address ("Unknown or Unsupported Device (…)") counts as unnamed', realName('Unknown or Unsupported Device (AA:07)', 'AA:07') === '' && realName('Neural DSP Nano Cortex', 'NN:01') === 'Neural DSP Nano Cortex');
+
+    // A fresh install scans for the Nano's service; a pedal found that way is taken at once, even without a name.
+    let p = makePicker();
+    check('with nothing remembered, Connect scans for the Nano Cortex service only ("nano" scan)', p.picker.beginRequest({}) === 'nano');
+    p.picker.onSelect([dev('NN:02')], p.cb);
+    check('"nano" scan: the first device offering the service is picked without a chooser, even unnamed', p.picked.join() === 'NN:02' && !(await chooserUp()));
+    check('picking it does not remember it yet', saved === null);
+    await js('__ui.demo = false; setStatus("Connected", true); __ui.demo = true'); await toShell(p);
+    check('remembered once the editor found C304/C305 on it (the page reports "ok")', saved && saved.id === 'NN:02' && saved.via === 'nano' && saved.name === 'Nano Cortex', JSON.stringify(saved));
+    saved = null;
+
+    // Nothing found yet: the chooser waits, with the pairing hint and the way to every device.
+    p = makePicker();
+    p.picker.beginRequest({});
+    p.picker.onSelect([], p.cb);
+    await waitFor(chooserUp); await synced();
+    check('"nano" scan, nothing yet: "Looking for your Nano Cortex" with the pairing hint',
+      (await js('document.querySelector("[data-fk=bt-title]").textContent')) === 'Looking for your Nano Cortex'
+      && /^Put the Nano Cortex in pairing mode: hold EXIT \+ CAPTURE for about a second, until the Gain ring lights up\./.test(await js('document.querySelector("[data-fk=bt-hint]").textContent')),
+      await js('document.querySelector("[data-fk=bt-hint]").textContent'));
+    check('"nano" scan: an empty list explains itself and offers Show all Bluetooth devices', await js('!!document.querySelector("[data-fk=bt-empty]") && !document.querySelector("[data-fk=bt-all]").hidden'));
+    await shot('bt-chooser-waiting');
+    await click('[data-fk="bt-all"]');
+    check('Show all Bluetooth devices closes the chooser and asks for an "all" scan', !(await chooserUp()) && JSON.stringify(await js('__ble.choices')) === '["all"]');
+    await toShell(p);
+    check('… which cancels the filtered request (the page starts the next one)', p.picked.join() === '' && p.picked.length === 1);
+
+    // Every device nearby: all listed, sorted, live, nothing remembered by picking.
+    p = makePicker();
+    check('the fallback list is an "all" scan', p.picker.beginRequest({ want: 'all' }) === 'all');
+    p.picker.onSelect(OTHERS.slice(0, 3), p.cb);
+    await waitFor(chooserUp); await synced();
+    check('"all" scan: no Nano-like name, so the chooser opens', (await js('document.querySelector("[data-fk=bt-title]").textContent')) === 'Choose your Nano Cortex' && (await js('document.querySelector("[data-fk=bt-all]").hidden')));
+    p.picker.onSelect(OTHERS, p.cb);
+    await synced();
+    const listed = await rowsText();
+    check('more than 8 devices: all 12 are listed (no cap)', listed.length === 12, listed.length + ': ' + listed.join(' | '));
+    check('the list updates while the chooser stays open', await chooserUp() && /Scanning… 12 devices nearby\./.test(await js('document.querySelector("[data-fk=bt-status]").textContent')));
+    check('in the chooser: Nano-like names first, then unnamed devices, then the rest',
+      listed.slice(0, 5).join(' | ') === 'Nanoleaf Shapes [Looks like a Nano Cortex] | Cortex Speaker [Looks like a Nano Cortex] | Unnamed device · …AA04 | Unnamed device · …AA07 | Unnamed device · …AA0C'
+      && listed[5] === 'JBL Flip 5', listed.join(' | '));
+    check('the list scrolls instead of growing past the window', await js('(() => { const l = document.querySelector(".bt-list"); return l.scrollHeight > l.clientHeight + 20 && document.querySelector(".bt-chooser").getBoundingClientRect().bottom <= innerHeight; })()'));
+    await shot('bt-chooser-all');
+    const razer = await js('[...document.querySelectorAll(".bt-row")].findIndex(r => r.dataset.id === "AA:02")');
+    await click('[data-fk="bt-dev-' + razer + '"]');   // scrolled into view, then a real click
+    await toShell(p);
+    check('clicking a row picks that device', p.picked.join() === 'AA:02' && !(await chooserUp()));
+    await failNoService(); await toShell(p);
+    check('a non-Nano pick is not remembered (its services were not found)', saved === null && p.picker.notNano.has('AA:02'));
+    check('… and the chooser is asked for again, with a notice', JSON.stringify(p.again) === '[{"want":"all","choose":true,"notice":"not-nano"}]', JSON.stringify(p.again));
+    p.picker.beginRequest(p.again[0]);
+    p.picker.onSelect(OTHERS, p.cb);
+    await waitFor(chooserUp); await synced();
+    const again = await rowsText();
+    check('the device that failed sorts last, marked "Not a Nano Cortex", and the notice says why',
+      again[again.length - 1] === 'Razer Nomv2X LE [Not a Nano Cortex]' && /isn’t a Nano Cortex/.test(await js('document.querySelector("[data-fk=bt-notice]").textContent')), again.join(' | '));
+    p.picker.onSelect([...OTHERS, NANO], p.cb);
+    await synced();
+    check('the Nano Cortex turning up while the chooser is open is picked by its name, and the chooser closes', p.picked.join() === 'AA:02,NN:01' && !(await chooserUp()));
+    await js('__ui.demo = false; setStatus("Connected", true); __ui.demo = true'); await toShell(p);
+    check('found via the full list: remembered with via "all", so the next scan starts there', saved && saved.id === 'NN:01' && saved.name === 'Neural DSP Nano Cortex' && saved.via === 'all' && p.picker.beginRequest({}) === 'all', JSON.stringify(saved));
+    p.picker.onSelect([NANO], p.cb);
+    check('the remembered pedal is picked at once', p.picked.slice(-1)[0] === 'NN:01');
+    await js('__ui.connectError = ""; render()');
+
+    // 1.0.0 remembered a Razer headset: the service failure forgets it and the chooser opens again.
+    saved = { id: 'AA:02', name: 'Razer Nomv2X LE', at: '2026-10-17T13:47:35.739Z' };
+    p = makePicker();
+    p.picker.beginRequest({ want: 'all' });
+    p.picker.onSelect(OTHERS, p.cb);
+    check('a remembered device is picked without asking', p.picked.join() === 'AA:02');
+    await failNoService(); await toShell(p);
+    check('a service failure (No Services matching A002/A003) clears the remembered device', saved === null);
+    check('… and asks for the chooser again', p.again.length === 1 && p.again[0].choose === true);
+    p.picker.beginRequest(p.again[0]);
+    p.picker.onSelect(OTHERS, p.cb);
+    await waitFor(chooserUp); await synced();
+    check('the forgotten device is not picked again; the chooser opens at once', p.picked.join() === 'AA:02' && await chooserUp());
+    await key('Escape'); await toShell(p);
+    check('Esc cancels the chooser', !(await chooserUp()) && p.picked.join() === 'AA:02,');
+    await js('__ui.connectError = ""; render()');
+
+    // A dropped link while looking for the services proves nothing: the remembered pedal stays.
+    saved = { id: 'NN:01', name: 'Neural DSP Nano Cortex', at: '2026-10-20T10:00:00.000Z', via: 'nano' };
+    p = makePicker();
+    p.picker.beginRequest({});
+    p.picker.onSelect([NANO], p.cb);
+    await js(`(() => { log('Requesting Nano Cortex...'); log('Service unavailable 0000a002-0000-1000-8000-00805f9b34fb: GATT Server is disconnected. Cannot retrieve services.'); log('Connect failed: C304/C305 not found under A002/A003'); })()`);
+    await toShell(p);
+    check('a dropped link during service discovery keeps the remembered pedal', saved && saved.id === 'NN:01' && p.again.length === 0);
+    await js('__ui.connectError = ""; render()');
+
+    // Scan again, and reconnect at launch.
+    p = makePicker();
+    p.picker.beginRequest({ want: 'all' });
+    p.picker.onSelect([dev('AA:01', 'JBL Flip 5')], p.cb);
+    await waitFor(chooserUp); await synced();
+    await click('[data-fk="bt-rescan"]');
+    check('Scan again closes the chooser and asks for a new scan', !(await chooserUp()) && (await js('__ble.choices.slice(-1)[0]')) === 'rescan');
+    await toShell(p);
+    check('… cancelling the running request first', p.picked.join() === '');
+    p = makePicker();
+    p.picker.beginRequest({ auto: true });
+    p.picker.onSelect([dev('NN:03', 'Neural DSP Nano Cortex'), ...OTHERS], p.cb);
+    await waitFor(() => p.picked.length > 0, { timeout: 2000 });
+    check('reconnect at launch takes only the remembered pedal: another Nano is not picked, no chooser', p.picked.join() === '' && p.hints.join() === 'auto-none' && !(await chooserUp()));
+    saved = null;
+    await js('__ble.choices.length = 0; __ble.results.length = 0; __ui.connectError = ""; render()');
+  }
+
+  // ---------------------------------------------------------------- update notifications
+  // src/updates.js (the shell's side) with a fake electron-updater and fake timers; its events drive the page's modal
+  // (__updates.event, as the preload bridge does) and the modal's answers (__updates.actions) go back to it.
+  {
+    const { createUpdates, installMode, notesExcerpt, FIRST_MS, DAY_MS } = require('../src/updates');
+    const { EventEmitter } = require('events');
+    check('updates: the macOS zip, the NSIS installer and the AppImage install themselves; the portable exe and the deb only link to the release',
+      installMode('darwin', {}) === 'install' && installMode('win32', {}) === 'install' && installMode('win32', { PORTABLE_EXECUTABLE_FILE: 'C:\\x\\nce.exe' }) === 'notify'
+      && installMode('linux', { APPIMAGE: '/home/x/nce.AppImage' }) === 'install' && installMode('linux', {}) === 'notify');
+    const HTML = '<h3>Fixed</h3>\n<ul>\n<li>Connecting on a computer with many Bluetooth devices (<a href="https://github.com/x">#15</a>).</li>\n<li>Only a real Nano Cortex is remembered &amp; reused.</li>\n</ul>\n<hr>\n<p>macOS builds are signed with a Developer ID.</p>';
+    check('release notes become plain text: headings, bullets, entities; the footer after the rule is left out',
+      notesExcerpt(HTML) === 'Fixed\n• Connecting on a computer with many Bluetooth devices (#15).\n• Only a real Nano Cortex is remembered & reused.', JSON.stringify(notesExcerpt(HTML)));
+    const long = notesExcerpt('word '.repeat(200), 100);
+    check('long release notes are cut at a word with an ellipsis', long.length <= 100 && long.endsWith('…') && !/wor…$/.test(long), JSON.stringify(long));
+
+    let settings = { auto: true, skipped: null };
+    let pageQueue = Promise.resolve();
+    const make = (mode) => {
+      const u = new EventEmitter();
+      u.calls = []; u.onCheck = null;
+      u.checkForUpdates = async () => { u.calls.push('check'); if (u.onCheck) return u.onCheck(); return {}; };
+      u.downloadUpdate = async () => { u.calls.push('download'); };
+      u.quitAndInstall = (...a) => u.calls.push('quitAndInstall ' + a.join(','));
+      const t = { timers: [], setTimeout: (fn, ms) => t.timers.push({ fn, ms, every: false, on: true }), setInterval: (fn, ms) => t.timers.push({ fn, ms, every: true, on: true }) };
+      t.clearTimeout = t.clearInterval = (id) => { if (t.timers[id - 1]) t.timers[id - 1].on = false; };
+      const r = { u, t, opened: [], events: [] };
+      r.up = createUpdates({
+        updater: u, store: { get: () => settings, set: (patch) => Object.assign(settings, patch) },
+        send: (ev) => { r.events.push(ev); pageQueue = pageQueue.then(() => js('__updates.event(' + JSON.stringify(ev) + ')')); },
+        openExternal: (url) => r.opened.push(url), currentVersion: '1.0.1', mode, releaseUrl: (v) => LINKS.releases + '/tag/v' + v, timers: t,
+      });
+      return r;
+    };
+    const synced = async () => { await pageQueue; await frame(); };
+    const answer = async (r) => { for (const a of await js('__updates.actions.splice(0)')) r.up.action(a); };   // the page's answers, as the bridge carries them
+    const modalUp = () => js('!!document.querySelector(".upd-modal")');
+    const buttons = () => js('[...document.querySelectorAll(".upd-modal .row button")].map(b => b.textContent).join("|")');
+    const toastText = () => js('document.getElementById("toast").classList.contains("show") ? document.getElementById("toast").textContent : ""');
+    const offer = async (r, version, notes = HTML) => { r.u.emit('update-available', { version, releaseNotes: notes }); await synced(); };
+
+    let r = make('install');
+    check('updates: nothing downloads by itself; a download the user started installs on quit', r.u.autoDownload === false && r.u.autoInstallOnAppQuit === true);
+    r.up.start();
+    check('updates: the first check ' + FIRST_MS / 1000 + ' s after launch, then every 24 hours', r.t.timers.length === 2 && r.t.timers[0].ms === FIRST_MS && !r.t.timers[0].every && r.t.timers[1].ms === DAY_MS && r.t.timers[1].every && DAY_MS === 86400000);
+    r.t.timers[0].fn();
+    check('the scheduled check asks the updater', r.u.calls.join() === 'check');
+
+    await offer(r, '1.0.2');
+    check('an update opens the modal: the new version, a notes excerpt and a link to the full notes',
+      await modalUp() && (await js('document.querySelector("[data-fk=upd-title]").textContent')) === 'Version 1.0.2 is available'
+      && (await js('document.querySelector("[data-fk=upd-notes]").textContent')).startsWith('Fixed\n• Connecting on a computer')
+      && (await js('document.querySelector("[data-fk=upd-notes-link]").href')) === LINKS.releases + '/tag/v1.0.2');
+    check('the three choices: Skip this version, Remind me later, Download and install', (await buttons()) === 'Skip this version|Remind me later|Download and install', await buttons());
+    await shot('update-available');
+    await click('[data-fk="upd-later"]'); await answer(r);
+    check('Remind me later closes the modal and stores nothing', !(await modalUp()) && settings.skipped === null);
+    r.t.timers[1].fn(); await offer(r, '1.0.2');
+    check('… and the next scheduled check offers it again', await modalUp());
+    await click('[data-fk="upd-skip"]'); await answer(r);
+    check('Skip this version closes the modal and stores the version', !(await modalUp()) && settings.skipped === '1.0.2');
+    const n0 = r.events.length;
+    r.t.timers[1].fn(); await offer(r, '1.0.2');
+    check('a skipped version is never offered by the automatic checks', r.events.length === n0 && !(await modalUp()));
+    await offer(r, '1.0.3');
+    check('a newer version is offered again', await modalUp() && (await js('document.querySelector("[data-fk=upd-title]").textContent')) === 'Version 1.0.3 is available');
+    await key('Escape'); await answer(r);
+    check('Esc means Remind me later', !(await modalUp()) && settings.skipped === '1.0.2');
+
+    // Download and install: progress, then Restart to update / Later.
+    await offer(r, '1.0.3');
+    await click('[data-fk="upd-download"]'); await answer(r);
+    check('Download and install starts the download and shows progress', r.u.calls.includes('download') && await js('!document.querySelector("[data-fk=upd-progress]").hidden') && (await buttons()) === '');
+    r.u.emit('download-progress', { percent: 42.4 }); await synced();
+    check('the progress bar follows the download', (await js('document.querySelector("[data-fk=upd-pct]").textContent')) === 'Downloading… 42\u202f%' && (await js('document.querySelector(".upd-bar > span").style.width')) === '42%');
+    await key('Escape');
+    check('Esc does nothing while downloading', await modalUp());
+    await shot('update-downloading');
+    r.u.emit('update-downloaded', { version: '1.0.3' }); await synced();
+    check('downloaded: "Version 1.0.3 is ready" with Later and Restart to update', (await js('document.querySelector("[data-fk=upd-title]").textContent')) === 'Version 1.0.3 is ready' && (await buttons()) === 'Later|Restart to update', await buttons());
+    await click('[data-fk="upd-later"]'); await answer(r);
+    check('Later closes it and says the update installs on quit', !(await modalUp()) && (await toastText()) === 'The update installs when you quit.' && !r.u.calls.some(c => c.startsWith('quitAndInstall')));
+    const c0 = r.u.calls.length;
+    await r.up.check(true); await synced();
+    check('Check for Updates… after a download offers the restart again, without checking', (await buttons()) === 'Later|Restart to update' && r.u.calls.length === c0, (await buttons()) + ' ' + r.u.calls.join());
+    await click('[data-fk="upd-restart"]'); await answer(r);
+    check('Restart to update quits and installs (and relaunches)', r.u.calls.includes('quitAndInstall false,true'));
+    await js('__updates.close()');
+
+    // Manual checks answer; automatic ones stay quiet unless there is something to offer.
+    r = make('install');
+    r.u.onCheck = () => { r.u.emit('update-not-available', { version: '1.0.1' }); return {}; };
+    await r.up.check(true); await synced();
+    check('Check for Updates…: "You’re up to date."', (await toastText()) === 'You’re up to date.' && r.events.map(e => e.type).join() === 'checking,none');
+    r.u.onCheck = () => { r.u.emit('error', new Error('Cannot find latest-mac.yml in the latest release artifacts\nstack…')); throw new Error('x'); };
+    await r.up.check(true); await synced();
+    check('Check for Updates…: an error shows as a toast', (await toastText()) === 'Couldn’t check for updates: Cannot find latest-mac.yml in the latest release artifacts', await toastText());
+    const e0 = r.events.length;
+    await r.up.check(false); await synced();
+    check('an automatic check that fails says nothing', r.events.length === e0);
+    r.u.onCheck = () => { r.u.emit('update-available', { version: '1.0.2', releaseNotes: HTML }); return {}; };   // the updater emits during the check
+    await r.up.check(true); await synced();
+    r.u.onCheck = null;
+    check('Check for Updates… offers a skipped version (it was asked for)', await modalUp() && (await js('document.querySelector("[data-fk=upd-title]").textContent')) === 'Version 1.0.2 is available');
+    await click('[data-fk="upd-download"]'); await answer(r);
+    r.u.emit('error', new Error('net::ERR_INTERNET_DISCONNECTED')); await synced();
+    check('a failed download closes the modal with a toast', !(await modalUp()) && (await toastText()) === 'The update couldn’t be downloaded: net::ERR_INTERNET_DISCONNECTED', await toastText());
+    // macOS: the zip is in ('update-downloaded'), then Squirrel.Mac refuses its signature (seen with ad-hoc builds).
+    r.u.onCheck = () => { r.u.emit('update-available', { version: '1.0.3', releaseNotes: '' }); return {}; };
+    await r.up.check(true); await synced(); r.u.onCheck = null;
+    await click('[data-fk="upd-download"]'); await answer(r);
+    r.u.emit('update-downloaded', { version: '1.0.3' }); await synced();
+    r.u.emit('error', new Error('Error: Code signature at URL file:///x/Nano%20Cortex%20Editor.app/ did not pass validation: code failed to satisfy specified code requirement(s)')); await synced();
+    check('an install refused after the download (Squirrel.Mac) closes the modal: nothing to restart', !(await modalUp()) && /^The update couldn’t be installed: Error: Code signature/.test(await toastText()) && r.up.state.downloaded === null, await toastText());
+    await r.up.check(true); await synced();
+    check('… and the next Check for Updates… checks again', r.u.calls.filter(c => c === 'check').length >= 3);
+
+    // Notify only (the portable exe, the deb): Download opens the release page.
+    r = make('notify');
+    check('notify-only builds never install on quit', r.u.autoInstallOnAppQuit === false);
+    await offer(r, '1.0.3');
+    check('notify-only: Skip this version, Remind me later, Download', (await buttons()) === 'Skip this version|Remind me later|Download', await buttons());
+    await click('[data-fk="upd-download"]'); await answer(r);
+    check('notify-only: Download opens the release page and downloads nothing', !(await modalUp()) && r.opened.join() === LINKS.releases + '/tag/v1.0.3' && !r.u.calls.includes('download'));
+
+    // The setting: off stops the schedule, on starts it again.
+    r = make('install');
+    r.up.start();
+    r.up.setAuto(false);
+    check('turning automatic checks off stores it and cancels the schedule', settings.auto === false && r.t.timers.every(x => !x.on));
+    const r2 = make('install'); r2.up.start();
+    check('with automatic checks off, nothing is scheduled at launch', r2.t.timers.length === 0);
+    r2.up.setAuto(true);
+    check('turning them on schedules them again', settings.auto === true && r2.t.timers.filter(x => x.on).length === 2);
+    settings = { auto: true, skipped: null };
+
+    // Settings → General → Advanced, and the Help menu.
+    await key(',', [MOD]);
+    await waitFor('!!document.querySelector(\'[data-fk="set-autoupdate"]\')');
+    check('Settings → Advanced: "Check for updates automatically", disabled outside the desktop app',
+      (await js('document.querySelector(\'[data-fk="set-autoupdate"]\').textContent')) === 'Check for updates automatically' && await js('document.querySelector(\'[data-fk="set-autoupdate"]\').disabled')
+      && (await js('document.querySelector(\'[data-fk="set-autoupdate-note"]\').textContent')) === 'Only in the desktop app.');
+    await key('Escape'); await waitFor('!document.querySelector(".modal")');
+    const help = menuFor(false).join(',');
+    check('Help → Check for Updates…', /Show Log File,-,Check for Updates…,Support the Project…/.test(help), help);
+  }
+
+  // ---------------------------------------------------------------- dev remote hardening (src/dev-remote.js)
+  // No window involved: who the remote answers (not a browser, not another Host name) and where /shot may write.
+  {
+    const { devRemoteRequestAllowed, refuseBrowserRequest, devShotPath, shotRoots } = require('../src/dev-remote');
+    const http = require('http');
+    const os = require('os');
+    const curl = { host: '127.0.0.1:4848', 'user-agent': 'curl/8.7.1', accept: '*/*' };
+    const ok = (extra, port = 4848, base = curl) => devRemoteRequestAllowed({ ...base, ...extra }, port);
+    check('dev remote: a plain curl (127.0.0.1 or localhost, with the right port) is allowed',
+      ok({}) && ok({ host: 'localhost:4848' }) && ok({ host: 'LocalHost:4848' }) && ok({ 'content-type': 'application/x-www-form-urlencoded' }));
+    check('dev remote: any Origin header is refused, whatever its value or spelling',
+      !ok({ origin: 'https://example.com' }) && !ok({ Origin: 'https://example.com' }) && !ok({ ORIGIN: 'null' }) && !ok({ origin: '' }) && !ok({ origin: 'http://127.0.0.1:4848' }));
+    check('dev remote: any Sec-Fetch-Site / -Mode / -Dest header is refused (an <img> or a no-cors fetch carries them)',
+      !ok({ 'sec-fetch-site': 'cross-site' }) && !ok({ 'Sec-Fetch-Mode': 'no-cors' }) && !ok({ 'SEC-FETCH-DEST': 'image' }) && !ok({ 'sec-fetch-site': 'same-origin' }));
+    check('dev remote: a Host that is not exactly 127.0.0.1:<port> or localhost:<port> is refused (DNS rebinding)',
+      !ok({ host: 'attacker.example:4848' }) && !ok({ host: 'attacker.example' }) && !ok({ host: '127.0.0.1' }) && !ok({ host: '127.0.0.1:4849' }) && !ok({ host: 'localhost' })
+      && !ok({ host: '127.0.0.1.attacker.example:4848' }) && !ok({ host: 'localhost.attacker.example:4848' }) && !ok({ host: '127.0.0.1:4848.attacker.example' })
+      && !ok({ host: '[::1]:4848' }) && !ok({ host: '0.0.0.0:4848' }) && !ok({ host: '' }) && !ok({ host: ['127.0.0.1:4848', 'attacker.example'] })
+      && !devRemoteRequestAllowed({ 'user-agent': 'curl' }, 4848) && !devRemoteRequestAllowed(undefined, 4848));
+    check('dev remote: the port in Host must be the remote\'s own', ok({ host: '127.0.0.1:4881' }, 4881) && !ok({ host: '127.0.0.1:4848' }, 4881));
+
+    // The same rules over a real socket: Node's own client sends exactly the headers given.
+    const server = http.createServer((req, res) => {
+      if (refuseBrowserRequest(req, res, server.address().port)) return;
+      res.setHeader('Content-Type', 'application/json'); res.end('{"ok":true,"ran":true}');
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = server.address().port;
+    const call = (headers, method = 'GET') => new Promise((resolve, reject) => {
+      const rq = http.request({ host: '127.0.0.1', port, path: '/eval', method, headers }, (res) => {
+        let body = ''; res.on('data', (c) => { body += c; }); res.on('end', () => resolve({ status: res.statusCode, body }));
+      });
+      rq.on('error', reject); rq.end(method === 'POST' ? '1+1' : undefined);
+    });
+    const plain = await call({}), withOrigin = await call({ Origin: 'https://example.com' }, 'POST');
+    const fetchImg = await call({ 'Sec-Fetch-Site': 'cross-site', 'Sec-Fetch-Mode': 'no-cors', 'Sec-Fetch-Dest': 'image' });
+    const rebound = await call({ Host: 'attacker.example:' + port }), viaName = await call({ Host: 'localhost:' + port });
+    server.close();
+    check('dev remote over HTTP: a plain request runs; Origin, Sec-Fetch-* and a foreign Host get 403 {ok:false,error:"browser requests are refused"} and nothing runs',
+      plain.status === 200 && JSON.parse(plain.body).ran === true && viaName.status === 200
+      && [withOrigin, fetchImg, rebound].every((r) => r.status === 403 && r.body === '{"ok":false,"error":"browser requests are refused"}'),
+      JSON.stringify([plain, withOrigin, fetchImg, rebound, viaName]));
+
+    // /shot: a .png inside test-output/, docs/images/ or a temp folder, nothing else.
+    const shotBase = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'nano-devshot-')));
+    const repo = path.join(shotBase, 'repo'), outside = path.join(shotBase, 'outside');
+    fs.mkdirSync(path.join(repo, 'test-output'), { recursive: true }); fs.mkdirSync(path.join(repo, 'docs', 'images'), { recursive: true }); fs.mkdirSync(outside);
+    fs.symlinkSync(outside, path.join(repo, 'test-output', 'link-out'));
+    fs.symlinkSync(path.join(outside, 'later.png'), path.join(repo, 'test-output', 'dangling.png'));
+    fs.symlinkSync(path.join(outside, 'target.png'), path.join(repo, 'test-output', 'to-file.png')); fs.writeFileSync(path.join(outside, 'target.png'), 'x');
+    const tmp = path.join(shotBase, 'tmp'); fs.mkdirSync(tmp);
+    // Explicit roots: the real list also has /tmp, which on Linux CI holds this fixture, and the "outside" cases must stay outside.
+    const roots = [path.join(repo, 'test-output'), path.join(repo, 'docs', 'images'), tmp];
+    check('dev remote /shot: the folders are test-output/, docs/images/ and the temp folder (plus /tmp off Windows)',
+      shotRoots(repo, tmp).slice(0, 3).join('|') === roots.join('|') && (process.platform === 'win32' || shotRoots(repo, tmp)[3] === '/tmp'));
+    const sp = (f) => devShotPath(f, repo, roots);
+    check('dev remote /shot: a .png in test-output/, docs/images/ or the temp folder is written (relative paths start at the repo root; not-yet-existing folders are fine)',
+      sp('test-output/a.png') === path.join(repo, 'test-output', 'a.png') && sp(path.join(repo, 'docs', 'images', 'x.PNG')) === path.join(repo, 'docs', 'images', 'x.PNG')
+      && sp(path.join(tmp, 'nano-shot.png')) === path.join(tmp, 'nano-shot.png') && sp('test-output/new-dir/deep/a.png') === path.join(repo, 'test-output', 'new-dir', 'deep', 'a.png')
+      && devShotPath(path.join(os.tmpdir(), 'nano-shot.png'), repo) === path.join(fs.realpathSync(os.tmpdir()), 'nano-shot.png')   // the default roots include the real OS temp folder
+      && (process.platform === 'win32' || devShotPath('/tmp/nano-shot.png', repo) === path.join(fs.realpathSync('/tmp'), 'nano-shot.png')));
+    check('dev remote /shot: not a .png, outside the three folders, or reaching out by ".." or by a symlink is refused (400 in the server)',
+      sp('test-output/a.txt') === null && sp('test-output/a.png.sh') === null && sp('test-output/png') === null && sp('test-output/') === null && sp('') === null && sp(undefined) === null && sp(null) === null
+      && sp('/etc/passwd.png') === null && sp(path.join(outside, 'x.png')) === null && sp('src/main.png') === null && sp('package.png') === null && sp('docs/x.png') === null
+      && sp('test-output/../src/x.png') === null && sp('test-output/../../outside/x.png') === null && sp('../outside/x.png') === null
+      && sp(path.join(repo, 'test-output') + '.png') === null && sp(path.join(repo, 'test-output-evil', 'a.png')) === null
+      && sp('test-output/link-out/x.png') === null && sp('test-output/dangling.png') === null && sp('test-output/to-file.png') === null
+      && sp('test-output/a\0.png') === null && sp(path.join(os.homedir(), 'Desktop', 'x.png')) === null && sp(path.join(os.homedir(), '.ssh', 'authorized_keys.png')) === null);
+    fs.rmSync(shotBase, { recursive: true, force: true });
+  }
 
   check('no console errors', consoleErrors.length === 0, consoleErrors.join(' | '));
 }

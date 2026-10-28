@@ -22,6 +22,12 @@
 # that. The macOS job then checks the app inside each zip (and each dmg) the way a download sees it.
 # Windows and Linux builds are unsigned and never see the Apple credentials. Windows: SmartScreen → More info → Run
 # anyway.
+#
+# Updates: every build also writes the metadata electron-updater reads in the app (package.json "publish": GitHub,
+# but electron-builder never publishes; --publish never): latest-mac.yml (both mac zips), latest.yml (the NSIS
+# installer), latest-linux.yml and latest-linux-arm64.yml (the AppImages), plus the .blockmap files for
+# differential downloads. They are uploaded with the installers, metadata last. The dmgs are left out of
+# latest-mac.yml (dmg.writeUpdateInfo false) because they are stapled after electron-builder hashed them.
 name: Release
 
 on:
@@ -52,6 +58,20 @@ jobs:
     outputs:
       matrix: ${{ steps.m.outputs.matrix }}
     steps:
+      - uses: actions/checkout@v4
+      # The app shows package.json's version (Settings → About, electron-updater compares it), so a release must
+      # carry the same one: refuse a tag push or a release_tag run when they differ.
+      - name: The version matches the tag
+        env:
+          TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.release_tag }}
+        run: |
+          [ -z "$TAG" ] && { echo "Dry run: no tag to match"; exit 0; }
+          v=$(node -p "require('./package.json').version")
+          if [ "v$v" != "$TAG" ]; then
+            echo "::error::package.json is $v but the release is $TAG. Bump package.json and pro/links.js first."
+            exit 1
+          fi
+          echo "package.json $v matches $TAG"
       - id: m
         env:
           PLATFORMS: ${{ github.event_name == 'workflow_dispatch' && inputs.platforms || 'all' }}
@@ -221,6 +241,8 @@ jobs:
             dist/*.exe
             dist/*.AppImage
             dist/*.deb
+            dist/*.blockmap
+            dist/latest*.yml
           if-no-files-found: error
 
   # A version tag: create (or update) the release and upload everything.
@@ -265,7 +287,10 @@ jobs:
             gh release create "$TAG" --title "Nano Cortex Editor ${TAG#v}" --notes-file notes.md --verify-tag
           fi
           shopt -s nullglob
-          gh release upload "$TAG" dist/*.dmg dist/*.zip dist/*.exe dist/*.AppImage dist/*.deb --clobber
+          gh release upload "$TAG" dist/*.dmg dist/*.zip dist/*.exe dist/*.AppImage dist/*.deb dist/*.blockmap --clobber
+          # Update metadata last: an app that sees it can already download the files it names.
+          meta=(dist/latest*.yml)
+          if [ ${#meta[@]} -gt 0 ]; then gh release upload "$TAG" "${meta[@]}" --clobber; fi
 
   # By hand with release_tag: add the files to that existing release; its notes and tag stay as they are.
   add-to-release:
@@ -284,6 +309,9 @@ jobs:
         run: |
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null   # fails if there is no such release
           shopt -s nullglob
-          files=(dist/*.dmg dist/*.zip dist/*.exe dist/*.AppImage dist/*.deb)
-          ls -la "${files[@]}"
+          files=(dist/*.dmg dist/*.zip dist/*.exe dist/*.AppImage dist/*.deb dist/*.blockmap)
+          meta=(dist/latest*.yml)
+          ls -la "${files[@]}" "${meta[@]}"
           gh release upload "$TAG" "${files[@]}" --clobber --repo "$GITHUB_REPOSITORY"
+          # Update metadata last: an app that sees it can already download the files it names.
+          if [ ${#meta[@]} -gt 0 ]; then gh release upload "$TAG" "${meta[@]}" --clobber --repo "$GITHUB_REPOSITORY"; fi

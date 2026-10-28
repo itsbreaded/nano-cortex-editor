@@ -9,6 +9,10 @@
   :root { --bg:#0e0e0e; --line:#2e2e2e; --fg:#ffffff; --dim:#ababab; --accent:#6954ff; --on-accent:#ffffff; }
   #c-send:not(:disabled) { background: var(--accent); color: var(--on-accent); font-weight: 600; }
   #c-send:not(:disabled):hover { filter: brightness(1.1); }
+  #c-preview:not(:disabled) { background: var(--accent); color: var(--on-accent); font-weight: 600; }
+  #c-preview:not(:disabled):hover { filter: brightness(1.1); }
+  #c-ir:not(:disabled) { background: var(--accent); color: var(--on-accent); font-weight: 600; }
+  #c-ir:not(:disabled):hover { filter: brightness(1.1); }
   * { box-sizing:border-box; margin:0; }
   html,body { height:100%; background:var(--bg); color:var(--fg);
     font:13px "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; user-select:none; }
@@ -42,7 +46,10 @@
     <button id="c-fwd" disabled title="Forward">&#8594;</button>
     <button id="c-reload" title="Reload">&#8635;</button>
     <button id="c-home" title="Cortex Cloud home">Home</button>
+    <button id="c-irs" title="Open your Cortex Cloud impulse responses">IRs</button>
     <button id="c-send" disabled title="Send this capture to the pedal over Bluetooth (open a capture page first)">Send to Nano Cortex</button>
+    <button id="c-preview" disabled title="Audition this capture on the Nano without loading it into a slot">Live Preview</button>
+    <button id="c-ir" disabled title="Toggle Cab / IR processing on the Nano">IR: --</button>
   </div>
 
   <div class="spacer"></div>
@@ -67,7 +74,38 @@
   $('c-fwd').onclick    = () => window.shell.cloud('forward');
   $('c-reload').onclick = () => window.shell.cloud('reload');
   $('c-home').onclick   = () => window.shell.cloud('home');
+  $('c-irs').onclick    = () => window.shell.cloud('irs');
   $('c-signout').onclick = () => window.shell.signOut();
+
+  let captureId = null;
+  let previewActive = false;
+  let previewBusy = false;
+  let previewPhase = 'idle';
+  let irConnected = false;
+  let irOn = false;
+  let irBusy = false;
+
+  function updateIRButton() {
+    const previewTransition = previewBusy || previewPhase === 'starting' || previewPhase === 'stopping';
+    $('c-ir').disabled = !irConnected || irBusy || previewTransition;
+    $('c-ir').textContent = irBusy ? 'IR: ...' : 'IR: ' + (irOn ? 'On' : 'Off');
+    $('c-ir').title = irOn ? 'Bypass Cab / IR processing on the Nano' : 'Enable Cab / IR processing on the Nano';
+    $('c-ir').style.opacity = irConnected ? '1' : '';
+  }
+
+  function updateCloudButtons() {
+    const hasCapture = !!captureId;
+    const busy = previewBusy || previewPhase === 'starting' || previewPhase === 'stopping';
+    $('c-send').disabled = !hasCapture || previewActive || busy;
+    $('c-preview').disabled = busy || (!hasCapture && !previewActive);
+    $('c-preview').textContent = previewPhase === 'starting' ? 'Preparing...'
+      : previewPhase === 'stopping' ? 'Stopping...'
+      : previewActive ? 'Stop Preview' : 'Live Preview';
+    $('c-preview').title = previewActive ? 'Stop the live capture preview' : 'Audition this capture on the Nano without loading it into a slot';
+    $('c-send').style.opacity = hasCapture && !previewActive && !busy ? '1' : '';
+    $('c-preview').style.opacity = hasCapture || previewActive ? '1' : '';
+    updateIRButton();
+  }
 
   window.shell.onTab((tab) => {
     $('t-editor').classList.toggle('on', tab === 'editor');
@@ -79,17 +117,73 @@
   $('c-send').onclick = async () => {
     $('c-send').disabled = true; $('c-send').textContent = 'Fetching…';
     try { await window.shell.sendCapture(); }
-    finally { $('c-send').textContent = 'Send to Nano Cortex'; $('c-send').disabled = false; }
+    finally { $('c-send').textContent = 'Send to Nano Cortex'; updateCloudButtons(); }
   };
-  window.shell.onCloudNav(({ canGoBack, canGoForward, captureId, pageKind }) => {
+  $('c-preview').onclick = async () => {
+    if (previewBusy || previewPhase === 'starting' || previewPhase === 'stopping') return;
+    if (previewActive) {
+      previewBusy = true; previewPhase = 'stopping'; updateCloudButtons();
+      try {
+        const result = await window.shell.stopPreview();
+        if (!result && previewActive) { previewBusy = false; previewPhase = 'active'; updateCloudButtons(); }
+      } finally {
+        updateCloudButtons();
+      }
+      return;
+    }
+    if (!captureId) return;
+    previewBusy = true; previewPhase = 'starting'; updateCloudButtons();
+    try {
+      const result = await window.shell.previewCapture();
+      if (!result.ok) { previewBusy = false; previewPhase = 'idle'; updateCloudButtons(); }
+    } finally {
+      updateCloudButtons();
+    }
+  };
+  $('c-ir').onclick = async () => {
+    if (!irConnected || irBusy || previewBusy || previewPhase === 'starting' || previewPhase === 'stopping') return;
+    irBusy = true; updateCloudButtons();
+    try {
+      const result = await window.shell.toggleCabIR();
+      if (result && result.ok) {
+        irConnected = true;
+        irOn = !!result.on;
+      } else if (result && result.error) {
+        alert(result.error);
+      }
+    } catch (err) {
+      alert('Could not toggle Cab / IR: ' + err.message);
+    } finally {
+      irBusy = false; updateCloudButtons();
+    }
+  };
+  window.shell.onCloudNav(({ canGoBack, canGoForward, captureId: pageCaptureId, pageKind }) => {
     $('c-back').disabled = !canGoBack;
     $('c-fwd').disabled = !canGoForward;
-    $('c-send').disabled = !captureId;
-    $('c-send').style.opacity = captureId ? '1' : '';
+    captureId = pageCaptureId || null;
+    updateCloudButtons();
     $('c-send').title = captureId ? 'Send this capture to the pedal over Bluetooth'
       : pageKind === 'preset' ? 'This is a preset. Only captures can be sent to the pedal for now.'
       : 'Open a capture\u2019s page first (Discover \u2192 Neural Captures).';
+    if (!previewActive) $('c-preview').title = captureId ? 'Audition this capture on the Nano without loading it into a slot'
+      : 'Open a capture\u2019s page first (Discover \u2192 Neural Captures).';
   });
+  window.shell.onPreviewState((state) => {
+    previewActive = !!(state && state.active);
+    previewPhase = (state && state.phase) || (previewActive ? 'active' : 'idle');
+    previewBusy = previewPhase === 'starting' || previewPhase === 'stopping';
+    updateCloudButtons();
+    if (state && state.error) alert(state.error);
+  });
+  const applyIRState = (state) => {
+    if (!state) return;
+    irConnected = !!state.connected;
+    irOn = !!state.on;
+    if (!irConnected) irBusy = false;
+    updateCloudButtons();
+  };
+  if (window.shell.onCabIRState) window.shell.onCabIRState(applyIRState);
+  if (window.shell.getCabIRState) window.shell.getCabIRState().then(applyIRState).catch(() => {});
 </script>
 </body>
 </html>

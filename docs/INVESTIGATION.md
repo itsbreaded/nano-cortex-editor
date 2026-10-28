@@ -95,7 +95,7 @@ Other notes:
 The website is a React app over `https://cloud-api.neuraldsp.com`. After login the token lives in the cookie
 `WEB_API_ACCESS_TOKEN`, so `fetch(..., { credentials: 'include' })` from the Cloud tab is authenticated. Routes seen
 in the bundle: `/login/v1/validate`, `/api/v1/user/signin|signout|profile|refresh_token`, `/homefeed/v1`,
-`/search/v1/for/{preset|neuralCapture|user}?page=&query=&sort=&sortDir=&size=`, `/api/v1/products/{id}`,
+`/search/v1/for/{preset|neuralCapture|impulseResponse|user}?page=&query=&sort=&sortDir=&size=`, `/api/v1/products/{id}`,
 `/api/v1/user/downloaded_products/{id}` (the site's "Download" button: marks the item for the user's devices),
 `/api/v1/user/downloaded_products_history/…`, `/api/v1/user/products/…` (own uploads).
 
@@ -152,6 +152,52 @@ millisecond timestamp, answered "Slot is empty").
 Implementation: `pro/transfer.js` (`NanoTransfer.uploadCapture`), the "Send to Nano" button in the Cloud tab
 (`src/main.js` fetches and unpacks the bundle with the Cloud session and hands it to the editor through
 `src/editor-preload.js`), and `receiveCapture()` in `pro/ui.js`.
+
+## 6a. IR download from Cortex Cloud to the pedal
+
+Source: a contributor's iOS Bluetooth HCI capture (2026-10-15, firmware 2.2.1; not published). It holds Bluetooth
+traffic only, no Cortex Cloud HTTPS, and one successful user-IR download to the pedal.
+
+The phone streams **type 15** to C304 using the same 500-byte chunk framing described above:
+
+```
+{ 1: 6,
+  3: { 1: <WAV bytes>, 2: <32-character lowercase MD5 hex of WAV bytes> },
+  4: <36-character Cortex Cloud product UUID>,
+  5: <filename ending in .wav> }
+```
+
+The observed WAV is 4,154 bytes: mono, 48 kHz, IEEE float32, 1,024 samples. The MD5 in field 3.2 matches the WAV
+bytes. The pedal replies with **type 16** `{1: 6, 3: 1, 4: {1: userIRIndex, 2: name}}` (field 3 = 1: accepted). The
+app then reads the current state (type 1), asks for the user IRs only (type 76 with field 6 set) and gets the updated
+library (type 77), where the new name sits at the index type 16 gave. No type 13 capture upload or type 78 slot load
+is involved: the IR lands in the library, and putting it in a slot is a separate step.
+
+This confirms the Bluetooth transfer protocol, WAV packaging, MD5, product identifier, acknowledgment, and library refresh.
+
+The authenticated Cloud Impulse Responses page was inspected in Chrome on 2026-10-15. Its account list uses
+`GET /search/v1/for/impulseResponse?...&ownedByMe=true...`; each paginated result includes `productId` and `name`.
+`GET /api/v1/products/{id}/download` returns `{ id, name, payload, payload_hash }`. For an IR, `payload` is
+base64-encoded raw RIFF/WAVE bytes (not a gzip/tar bundle). The verified sample was 4,154 bytes, mono, 48 kHz,
+IEEE float32, matching the IR in the Bluetooth trace. The pedal expects an MD5 of the decoded WAV, so the editor
+computes it locally instead of passing through Cloud's `payload_hash`.
+
+The app injects a **Send to Nano** action on each IR row of the account page (only on a Cortex Cloud host and that
+path), fetches the WAV through the embedded Cloud session, checks it (`src/cloud-ir.js`: at most 1 MB decoded; a
+`fmt ` chunk with PCM 16/24/32-bit or float 32/64-bit, 1–2 channels, 8–192 kHz; a non-empty `data` chunk), confirms
+the transfer in the Pro Editor, sends type 15, waits for type 16 and reads the library again (76/77). Code:
+`src/main.js`, `src/cloud-preload.js`, `src/editor-preload.js`, `pro/transfer.js`, `pro/ui.js`. Not yet verified end
+to end with a pedal.
+
+### Deleting an IR from the pedal
+
+Source: a local BLE capture of the iOS Cortex Cloud app deleting one user IR from a Nano Cortex
+(firmware 2.2.1; not published). The app sends **type 82** with `{1: 2, 4: {1: libraryIndex, 2: name}}`, e.g.
+`{1: 2, 4: {1: 0, 2: "My IR"}}` (index and name exactly as type 77 lists them). The pedal confirms with **type 83**
+`{1: 6, 3: 1}`. The app then
+requests the library with type 76 and receives type 77 without the deleted IR. This gives us the request, success
+acknowledgment, and refresh flow needed for deletion. The editor uses this only for user IRs; factory cabs are
+not deletable.
 
 ## 7. Deleting a preset (decoded from the phone app, 2026-10-08)
 
@@ -311,16 +357,98 @@ length, which the core's `frameType()` rejects, so `pro/ui.js` reads it before t
 | 9 | 12 (?) | 0 / 1 | 4-Preset / 2-Preset mode? The pedal re-sends its preset after a write | **unverified**, not exposed |
 | 7 | ? | 1 / 0 | A boolean touching capture/cab routing (state dump follows) | **unverified** |
 | 8 | ? | 1 / 0 | A boolean | **unverified** |
-| 12 | ? | 1 / 0 | A boolean | **unverified** |
-| 13 | ? | 1 / 0 | A boolean | **unverified** |
+| 12 (varint, explicit 0/1) | 15 | 1 / 0 | Mute Guitar Input | **confirmed** |
+| 13 (varint, explicit 0/1) | 16 | 1 / 0 | Mute Guitar Output (Outputs 1L/2R) | **confirmed** |
 | 15 | ? | 0 / 1 / 2 | A 3-way choice (MIDI clock source?) | **unverified** |
 | 16 | ? | 0…3 | A 4-way choice (IR bypass on outputs?) | **unverified** |
 | 18 | ? | 1 / 0 | A boolean | **unverified** |
 | — | 7, 11, 13, 14 | 1, 0, 129, 1 | Read-only so far (13 read 172 during capture mode) | **unverified** |
 
+The two monitoring mappings are now confirmed by correlating the local trace's standalone 67.12/67.13 boolean writes
+with the type-66 readback layout and the normal type-68 acknowledgement. Type 67 field 12 reads back as type 66
+field 15, and type 67 field 13 reads back as type 66 field 16. Each setting is sent alone with an explicit varint 0
+or 1. The official manual confirms the user-facing behavior: input mute affects the Guitar Input monitor path, while
+output mute affects the processed signal at Outputs 1L/2R; USB audio is a separate path.
+
+Normalized frames used by the editor and demo are:
+
+- Mute Input on/off: `08 C0 08 01 60 01 43 00 00 00` / `08 C0 08 01 60 00 43 00 00 00`.
+- Mute Outputs 1L/2R on/off: `08 C0 08 01 68 01 43 00 00 00` / `08 C0 08 01 68 00 43 00 00 00`.
+- Successful type-68 ACK: `08 C0 08 01 18 01 44 00 00 00`.
+- Type-66 readback uses protobuf tags `0x78` (field 15) and `0x80` (field 16); an omitted boolean is off.
+
 The 66 ↔ 67 numbering is not a fixed offset (4 ↔ 6 but 14 ↔ 17), so the unexposed 66 fields cannot be matched to
 their 67 field yet. Guesses in our code: a brightness of 0 is sent as an explicit `20 00` (the app never sent 0); the
 USB range −20…0 dB in 0.5 dB steps is ours (the app's slider went at least −13.9…−5.5); type-18 field 8 is shown as
-the description although it was empty in every reply.
+the description although it was empty in every reply. On a real pedal (2026-10-24) some captures carry their Cortex
+Cloud product ID as the whole description (capture "Darkglass MT900V2 1"; the Cloud API knows the ID as a
+`neural_capture`, and `https://cloud.neuraldsp.com/cloud/neural-capture/view/<id>` opens it); the editor offers
+**Open in Cortex Cloud** for those instead of showing the ID (`pro/capture-text.js`).
 
 The 2026-10-09 phone-app session (footswitch assignment, tempo, expression, global settings, capture mode) is decoded in `docs/TRACE-2026-10-09.md`.
+
+## 12. Live reports, auditions and preset moves (contributed in #14, firmware 2.2.1)
+
+Sources: a contributor's phone-app BLE captures (2026-10-14/15; not published) and their hardware tests. Frames below
+use neutral values. Implementation: `pro/live-sync.js` (live reports), `pro/transfer.js` (streamed 150, 15) and
+`pro/ui.js` (auditions, preset moves).
+
+**Live reports (pedal → app, unsolicited).** Protobuf leaves zero values out, so a missing field means 0.
+
+| Type | Body | Meaning | Editor |
+|---|---|---|---|
+| 26 | `{1:1 3:control 4:raw 6:1}` | A knob moved: control 0 gain, 1 level, 2 bass, 3 mid, 4 treble, 10 capture volume, 11 gate (raw − 108 = reduction %) | applied; other controls → one state read |
+| 99 | `{1:1 3:FX slot 0–4 4:param index 5:raw 0–255 (f32)}` | An FX parameter moved; comes with a type-26 control 6 carrying the same raw value | applied by slot and index |
+| 31 | `{1:1 3:enable slot 4:0 on / 1 off}` | An FX block switched (enable slots 4–8 = Pre FX 1 … Post FX 3) | applied, unless the user's own click is still unconfirmed |
+| 31 | `{1:1}` | Something changed | one coalesced state read (FX models kept) |
+| 64 | `{1:1 3:2 4:position 0–255}` | Expression pedal position (heel: field 4 left out). The pedal also answers an assignment read (60) with `{1:1 3:2}`, so 64 is ignored while that read is outstanding | amp knobs, capture level and gate follow the assigned ranges; an FX Amount only where the parameter is known (Mix / Amount, Transpose → Semitones); a throttled (250 ms) read-back of the assigned FX blocks shows the rest |
+| 94 | — | A cab parameter changed | one state read |
+| 115 | `{1:1 3:dirty}` | Preset dirty state (upstream) | the only source of the unsaved-changes mark |
+
+**Capture audition (Cortex Cloud "Play").** Not the library upload (13): nothing is written to a slot or the library.
+
+```
+150 (streamed like 13) { 5: { 1: { 1: <.cns bytes>, 2: <hex MD5 of the .cns> }, 2: <CaptureRecord as in 13> }, 7: 2, 8: 1 }
+151                    { 1: 6, 3: 1, 4: { 1: 2, 2: <name>, 3: <hash> } }          3 = 1: playing
+148                    { 2: <transaction>, 3: 0 }                                   stop (capture)
+149                    { 1: 1, 2: <same transaction>, 3: 1 }                        stopped
+```
+
+**IR audition (a library IR, without loading it into a slot).** Factory cabs and user IRs use different record
+fields; the trace shows field 3 for a factory cab, field 4 for user IRs is the matching guess (unverified).
+
+```
+158 { 3: { 1: <factory index>, 2: <name> }, 8: 1 }   or   { 4: { 1: <user index>, 2: <name> }, 8: 1 }
+159 { 1: 6, 3: 1, 4: { 2: <name> } }                  3 = 1: playing; a new 158 replaces the IR playing
+148 { 2: <transaction>, 4: 0 }                         stop (IR)
+149 { 1: 1, 2: <same transaction>, 3: 1 }
+```
+
+For example, factory cab 0 "412 V30": `13 C0 1A 0B 08 00 12 07 34 31 32 20 56 33 30 40 01 9E 00 00 00`.
+
+The transaction is the app's millisecond clock (a varint past 2³²); the pedal echoes it in both 149s seen (capture and
+IR), and the editor only takes a stop as confirmed when it does. While anything is auditioned, the app sends
+**91** `{1: 3}` about every 20 s and the pedal answers **92** `{1: 3, 3: 1, …}`; without it the pedal ends the
+audition after about a minute. After a stop the app reads the current state, and the pedal may then report the
+preset dirty (115) even though nothing was edited. While a capture preview plays, a state read reports the previewed
+capture as the current one (seen in the native edition on the pedal, 2026-10-24: the name stayed after the stop until
+the next read), so the editor reads the state again after every confirmed stop.
+
+**Preset move.** One message moves a preset by insertion (the presets in between shift by one); indices are 0-based:
+
+```
+143 { 1: 4, 3: <from>, 4: <to> }          e.g. 5 → 3: 0A C0 08 04 18 04 20 02 8F 00 00 00
+144 { 1: 6, 3: <from>, 4: <to>, 5: 1 }    5 = 1: moved
+```
+
+The app then reads the preset list again (type 1 `{1: 3, 3: 0, 4: 1, 5: 1}`; the editor uses upstream's full metadata
+read) and the state. The pedal sent 115 dirty then clean around one move; the editor ignores 115 while a move is
+outstanding and takes the dirty state from the state read after it. Observed moves: 5 → 3 and 36 → 6. How footswitch
+assignments and the current preset follow a move is read from the pedal afterwards, not assumed.
+
+What the editor checks (from the contributor's spec): a 158 carries the exact index and name type 77 listed, in
+field 3 or 4 by kind, and never comes with a 78, 80 or a save; the stop sends 148 and accepts only a 149 with the same
+transaction and status 1; the keep-alive runs only between an accepted 151/159 and a confirmed 149 (or a disconnect);
+a 143 uses absolute indices even when the list is filtered; a failed or unconfirmed move ends with the order read
+from the pedal, never an assumed one.
+

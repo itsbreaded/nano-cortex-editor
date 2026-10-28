@@ -77,6 +77,7 @@
       amp_head: { icon: KIND_ICONS.ampHead, label: 'Amp head' },
       amp: { icon: KIND_ICONS.ampHead, label: 'Amp head' },
       combo: { icon: KIND_ICONS.combo, label: 'Combo' },
+      amp_combo: { icon: KIND_ICONS.combo, label: 'Combo' },   // the word a real pedal reports for combos
       pedal: { icon: KIND_ICONS.pedal, label: 'Pedal' },
       preamp: { icon: KIND_ICONS.rack, label: 'Preamp' },
       rack: { icon: KIND_ICONS.rack, label: 'Rack' },
@@ -118,8 +119,7 @@
   const ui = {
     selected: 'capture',
     demo: false,
-    expressionBaseline: null,
-    expressionBaselineBoundary: false,
+    clearOverridesOnRead: true,   // the next state dump replaces local edits of expression targets
     expressionLocalOverrides: new Map(),
     pendingBypassTargets: new Map(),
     bypassWriteChain: Promise.resolve(),
@@ -138,14 +138,27 @@
     knobDragging: false,  // defer full renders while a pointer drag owns a knob
     renderAfterKnob: false,
     sideSig: '',
+    presetReorderBusy: false,
+    presetUnknown: false,   // a read after a preset move failed: which preset the pedal is on isn't known
     lastAction: '',
     logs: [],
     logSeq: 0,   // lines ever logged; each entry carries its number, so readers can index past the trim below
     usage: null,          // last slot usage scan: { captures, cabs, library, cabLibrary, date, complete, scanned, total }
     scanning: false,
     scanStop: false,
+    previewing: false,
+    previewBusy: false,
+    previewName: '',
+    cabIRLoadActive: null,
+    cabIRLoadQueue: [],
+    cabIRLoadPaused: false,
+    cabIRLoadTimedOut: null,
+    captureSlotPreselect: 0,
+    pendingIRSlotTarget: null,
   };
   window.__ui = ui; // handy for poking at from DevTools
+  let presetMoveProtocolPending = false;
+  let suppressPresetClickUntil = 0;
 
   // ------------------------------------------------------------------ settings storage + accent colour
   // Small per-machine preferences in localStorage under "settings.*". The metronome keeps its own "metronome" key.
@@ -233,9 +246,12 @@
     const cat = CATEGORY_KEY[def.category] || 'utility';
     return READABLE[cat] || FX_COLORS[cat] || FX_COLORS.utility;
   }
-  // Two Quad Cortex hues are too dark on a near-black panel; same family, more light.
-  const READABLE = { modulation: '#8f78ff', equalizer: '#4a9eff' };
+  // Two Quad Cortex hues are too dark on a near-black panel; same family, more light. Upstream gives Reverb the
+  // same #00FFDD as Delay, so a delay next to a reverb looked identical: Reverb is soft pink here (both editions).
+  // Every category colour goes through stageColor(), so this map is the one place for them.
+  const READABLE = { modulation: '#8f78ff', equalizer: '#4a9eff', reverb: '#f570d6' };
   STAGES.forEach(s => Object.defineProperty(s, 'color', { get: () => stageColor(s.key) }));
+  window.__stageColor = stageColor;   // the UX test checks every category's colour
 
   const presetName = (n) => state.presetNames.get(n) || ('Preset ' + n);
   const captureSlotCount = () => Math.max(25, ...state.captureNames.keys());
@@ -256,14 +272,36 @@
     return state.capture.selectedSlot || null;
   }
   function activeIRSlot() {
+    const pending = ui.pendingIRSlotTarget;
+    if (pending && pending.preset === Number(state.selectedPreset)) return pending.slot;
     if (!state.cabIR.on) return 0;
     if (state.cabIR.fromLibrary) return null;
     const sel = state.cabIR.selectedSlot;
-    if (sel && sameName(state.irNames.get(sel), state.currentIR.shortName)) return sel;
+    if (Number.isInteger(sel) && sel >= 1 && sel <= 5) return sel;
     for (let i = 1; i <= irSlotCount(); i++) {
       if (state.currentIR.shortName && sameName(state.irNames.get(i), state.currentIR.shortName)) return i;
     }
     return state.cabIR.selectedSlot || null;
+  }
+
+  function selectedIRIsFactory() {
+    const slot = activeIRSlot();
+    const name = slot && state.irNames.get(slot);
+    const factoryIRs = state.library.irFactory || [];
+    if (slot && slot >= 1 && slot <= 5 && state.library.loaded) {
+      // With the pedal library loaded, a pedal slot is factory only when its
+      // actual contents match a factory entry. Missing or user names must not
+      // inherit the microphone from an IR that was only being previewed.
+      return Boolean(name && factoryIRs.some(item => sameName(item.name, name)));
+    }
+    if (name) {
+      // The selected pedal slot is authoritative when preview state leaves the
+      // current IR name stale. Unknown slot names are non-factory once the
+      // pedal library has been read, rather than inheriting the preview's mic.
+      if (factoryIRs.some(item => sameName(item.name, name))) return true;
+      if ((state.library.irUser || []).some(item => sameName(item.name, name)) || state.library.loaded) return false;
+    }
+    return isFactoryCabIR();
   }
 
   const shortMic = (m) => String(m || '').replace('Condenser', 'Cond').replace('Dynamic', 'Dyn').replace('Ribbon', 'Rib');
@@ -299,7 +337,7 @@
       return {
         on,
         model: name || 'Cab / IR',
-        sub: !on ? 'Bypassed' : state.cabIR.fromLibrary ? 'From the library: ' + (name || 'cab') : (isFactoryCabIR() ? shortMic(state.cabIR.mic) + ', pos ' + state.cabIR.position : (state.currentIR.inBank === false ? 'Library IR' : 'User IR')),
+        sub: !on ? 'Bypassed' : state.cabIR.fromLibrary ? 'From the library: ' + (name || 'cab') : (selectedIRIsFactory() ? shortMic(state.cabIR.mic) + ', pos ' + state.cabIR.position : (state.currentIR.inBank === false ? 'Library IR' : 'User IR')),
         canToggle: true,
       };
     }
@@ -399,6 +437,8 @@
 
   async function doSave() {
     if (!state.connected) { toast('Connect your Nano Cortex to save'); return; }
+    if (presetUnknownRefuses()) return;
+    if (!(await stopAnyAudition('Save'))) return;
     flushTempo();
     await savePreset(); // the outcome arrives through showSaveResult()
   }
@@ -407,6 +447,7 @@
   // (the same reload doDelete() uses for the current preset).
   async function doDiscard() {
     if (!state.connected) { toast('Connect your Nano Cortex first'); return; }
+    if (presetUnknownRefuses()) return;
     const n = state.selectedPreset;
     const choice = await modal({
       title: 'Discard edits to ' + presetName(n) + '?',
@@ -414,6 +455,7 @@
       buttons: [{ id: 'cancel', label: 'Cancel' }, { id: 'ok', label: 'Discard', primary: true }],
     });
     if (choice !== 'ok') { render(); return; }
+    if (!(await stopAnyAudition('Discard'))) return;
     ui.lastAction = 'Discarding edits\u2026'; renderStatus();
     state.exp.loaded = false;   // the pedal reloads the saved set too; read it again
     await selectPreset(n);
@@ -428,6 +470,7 @@
   // with the chosen slot and name; verified on the pedal 2026-10-08 from the native app.
   async function doSaveAs(preselect) {
     if (!state.connected) { toast('Connect your Nano Cortex to save'); return; }
+    if (presetUnknownRefuses()) return;
     const from = state.selectedPreset;
     let target = Number.isInteger(preselect) && preselect !== from ? preselect : 0;
     for (let i = 1; !target && i <= 64; i++) if (i !== from && presetName(i) === 'Empty') { target = i; break; }
@@ -453,6 +496,7 @@
     const name = input.value.trim();
     if (name.length < 4) { toast('Preset name must have at least 4 characters.'); return; }
     if (new TextEncoder().encode(name).length > 64) { toast('Preset name is too long.'); return; }
+    if (!(await stopAnyAudition('Save as'))) return;
     await savePresetAs(target, name);
   }
   async function savePresetAs(n, name) {
@@ -487,6 +531,7 @@
       buttons: [{ id: 'cancel', label: 'Cancel' }, { id: 'ok', label: 'Delete', primary: true }],
     });
     if (choice !== 'ok') { render(); return; }
+    if (!(await stopAnyAudition('Delete'))) return;
     const ok = await deletePresetOnPedal(n);
     if (!ok) { toast('The pedal refused to delete preset ' + n); render(); return; }
     state.presetNames.set(n, 'Empty');
@@ -523,9 +568,10 @@
     if (!state.connected) { toast('Connect your Nano Cortex first'); return false; }
     // The pedal drops the current preset's unsaved edits on an assignment (seen in the trace, INVESTIGATION §8),
     // so ask first, like a preset switch does.
-    const dirty = pedalDirtyForUI();
+    const dirty = isDirtyNow();
+    let choice = null;
     if (dirty) {
-      const choice = await modal({
+      choice = await modal({
         title: 'Save changes to ' + presetName(state.selectedPreset) + '?',
         body: 'Assigning a footswitch discards edits that haven\u2019t been saved to the pedal.',
         buttons: [
@@ -535,8 +581,9 @@
         ],
       });
       if (choice === 'cancel' || !choice) { render(); return false; }
-      if (choice === 'save') await doSave();
     }
+    if (!(await stopAnyAudition('the footswitch assignment'))) return false;
+    if (dirty && choice === 'save') await doSave();
     const n = presetIndex + 1;
     const f = await writeAndAwait('Assign preset ' + n + ' to footswitch ' + fs.label, footswitchFrame(slotKey, presetIndex), MSG.SetPresetSlotsResponse);
     if (fieldValue(f, 4) !== 1) {
@@ -557,6 +604,7 @@
 
   async function doRename() {
     if (!state.connected) { toast('Connect your Nano Cortex to rename presets'); return; }
+    if (presetUnknownRefuses()) return;
     const n = state.selectedPreset;
     const input = el('input', { class: 'search', type: 'text', value: presetName(n), maxlength: '64', 'aria-label': 'Preset name', spellcheck: 'false' });
     const choice = await modal({
@@ -564,6 +612,7 @@
       buttons: [{ id: 'cancel', label: 'Cancel' }, { id: 'ok', label: 'Rename', primary: true }],
     });
     if (choice !== 'ok') { render(); return; }
+    if (!(await stopAnyAudition('Rename'))) return;
     const err = await renamePresetTo(n, input.value);
     if (err) { toast(err); return; }
     ui.sideSig = '';
@@ -632,6 +681,11 @@
     gap: { on: false, play: 3, mute: 1 },
   });
   const levelDefaults = () => ({ accent: 1, main: 1, sub: 1 });
+  // The click sounds per role (Settings → Metronome → Sounds): a built-in voice each, and optionally the user's own
+  // sample, which replaces it (metro.samples[role] = { name }; the copy lives in the shell, src/metro-samples.js).
+  const SOUND_ROLES = [['accent', 'Accent'], ['main', 'Main beat'], ['sub', 'Subdivision']];
+  const soundDefaults = (v = 'click') => ({ accent: v, main: v, sub: v });
+  const VOICE_IDS = ['click', 'woodblock', 'tick', 'beep', 'cowbell'];   // the built-in voices (VOICES below), in menu order
 
   // Off-beat position inside a beat. Swing 0 % is straight; 100 % moves the off-beat to the
   // triplet position (2/3 for eighths; each sixteenth pair likewise inside its half beat).
@@ -685,7 +739,7 @@
 
   const metro = {
     open: false, running: false, mode: 'simple', opensIn: 'simple',
-    bpm: 100, beats: 4, volume: 0.6, output: '', sound: 'click',
+    bpm: 100, beats: 4, volume: 0.6, output: '', sounds: soundDefaults(), samples: {},
     adv: advDefaults(), levels: levelDefaults(),
     // Tempo source. Later: follow the preset's tempo (two-way) once the pedal's tempo message is decoded.
     tempoFollowsPreset: false, presetTempo: null,
@@ -698,9 +752,18 @@
   metro.adv = normSetup(metro.adv);
   metro.levels = Object.assign(levelDefaults(), metro.levels);
   for (const k of Object.keys(levelDefaults())) { const v = Number(metro.levels[k]); metro.levels[k] = Number.isFinite(v) ? clamp(v, 0, 1) : 1; }
+  // One "sound" for every role before per-role sounds: it becomes each role's sound.
+  metro.sounds = Object.assign(soundDefaults(typeof metro.sound === 'string' ? metro.sound : 'click'), metro.sounds);
+  delete metro.sound;
+  metro.samples = metro.samples && typeof metro.samples === 'object' ? metro.samples : {};
+  for (const [k] of SOUND_ROLES) {
+    if (!VOICE_IDS.includes(metro.sounds[k])) metro.sounds[k] = 'click';
+    if (metro.samples[k] && typeof metro.samples[k].name !== 'string') delete metro.samples[k];
+  }
+  for (const k of Object.keys(metro.samples)) if (!SOUND_ROLES.some(([r]) => r === k)) delete metro.samples[k];
   if (metro.opensIn !== 'advanced') metro.opensIn = 'simple';
   metro.mode = metro.opensIn;
-  const saveMetro = () => { try { localStorage.setItem('metronome', JSON.stringify({ bpm: metro.bpm, beats: metro.beats, volume: metro.volume, output: metro.output, sound: metro.sound, opensIn: metro.opensIn, adv: metro.adv, levels: metro.levels })); } catch { /* fine */ } };
+  const saveMetro = () => { try { localStorage.setItem('metronome', JSON.stringify({ bpm: metro.bpm, beats: metro.beats, volume: metro.volume, output: metro.output, sounds: metro.sounds, samples: metro.samples, opensIn: metro.opensIn, adv: metro.adv, levels: metro.levels })); } catch { /* fine */ } };
   // The one tempo the scheduler reads.
   const effectiveBpm = () => (metro.tempoFollowsPreset && Number(metro.presetTempo) > 0 ? clamp(Number(metro.presetTempo), 30, 300) : metro.bpm);
   // What the scheduler plays: one pattern per layer. Today a single layer; a polyrhythm adds a
@@ -737,13 +800,15 @@
     return audio;
   }
   // Click sounds, synthesized from Web Audio nodes (no sample files). `p` scales the pitch
-  // (subdivision ticks use a higher variant of the same sound).
+  // (subdivision ticks use a higher variant of the same sound). Each click's nodes end in `voiceOut`, the click's own
+  // gain node (see click()), so the next click can cut it.
+  let voiceOut = null;
   const envelope = (at, peak, attack, decay) => {
     const g = audio.createGain();
     g.gain.setValueAtTime(0.0001, at);
     g.gain.linearRampToValueAtTime(Math.max(0.0002, peak), at + attack);
     g.gain.exponentialRampToValueAtTime(0.0001, at + attack + decay);
-    g.connect(audio.destination);
+    g.connect(voiceOut || audio.destination);
     return g;
   };
   const tone = (at, type, freq, dest, len) => {
@@ -783,7 +848,7 @@
       g.gain.linearRampToValueAtTime(vol * (accent ? 0.9 : 0.7), at + 0.005);
       g.gain.setValueAtTime(vol * (accent ? 0.9 : 0.7), at + 0.09);
       g.gain.exponentialRampToValueAtTime(0.0001, at + 0.13);
-      g.connect(audio.destination);
+      g.connect(voiceOut || audio.destination);
       tone(at, 'sine', (accent ? 1760 : 880) * p, g, 0.14);
     } },
     cowbell: { name: 'Cowbell', play(at, accent, vol, p = 1) {   // two detuned square partials ~560/845 Hz through a band-pass, short
@@ -793,29 +858,175 @@
       tone(at, 'square', 560 * k, bp, 0.11); tone(at, 'square', 845 * k, bp, 0.11);
     } },
   };
-  // Per role: which Levels slider scales it, a fixed trim, and how the chosen synth voice renders it.
+  // Per role: which Levels slider scales it, a fixed trim, which sound plays it (Settings → Metronome → Sounds), and how
+  // a built-in voice renders it. Soft beats play the main sound, quieter.
   const ROLE_MIX = {
-    accent: { level: 'accent', trim: 1, accent: true, pitch: 1 },
-    normal: { level: 'main', trim: 1, accent: false, pitch: 1 },
-    soft: { level: 'main', trim: 0.45, accent: false, pitch: 1 },
-    sub: { level: 'sub', trim: 0.5, accent: false, pitch: 1.5 },
+    accent: { level: 'accent', sound: 'accent', trim: 1, accent: true, pitch: 1 },
+    normal: { level: 'main', sound: 'main', trim: 1, accent: false, pitch: 1 },
+    soft: { level: 'main', sound: 'main', trim: 0.45, accent: false, pitch: 1 },
+    sub: { level: 'sub', sound: 'sub', trim: 0.5, accent: false, pitch: 1.5 },
   };
   const roleGain = (role) => { const m = ROLE_MIX[role]; return m ? metro.volume * metro.levels[m.level] * m.trim : 0; };
-  // The sound source for a role: { play(at, gain) }. Today the synth voice picked in Settings;
-  // a decoded user sample per role can be returned here later.
+
+  // Custom samples. The shell does the file dialog, the checks, the copy into its data folder and the reads
+  // (src/metro-samples.js, IPC 'metro-sample'); this page names only the operation and the role, decodes the bytes
+  // once into an AudioBuffer (the first 2 s) and plays it through the same graph as the built-ins. The UX test swaps
+  // the bridge for its own (__metro.samples.setBridge), which also runs the launch-time load again.
+  const SAMPLE_MAX_S = 2;
+  const sampleBufs = {};   // role (accent | main | sub) → AudioBuffer
+  const samples = { bridge: shellBridge && shellBridge.metroSample ? (op, role) => shellBridge.metroSample(op, role) : null };
+  // Chromium decodes WAV, MP3, AAC/M4A, FLAC and Ogg (Vorbis, Opus) on every platform, but not AIFF: uncompressed
+  // AIFF and AIFF-C (what Logic and GarageBand export) are read here. Big-endian PCM unless AIFF-C says 'sowt'
+  // (little-endian) or 'fl32'/'fl64' (float); the sample rate is an 80-bit float. Returns null for anything else.
+  function readAiff(bytes) {
+    const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const tag = (o) => (o + 4 <= bytes.length ? String.fromCharCode(bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]) : '');
+    if (tag(0) !== 'FORM' || (tag(8) !== 'AIFF' && tag(8) !== 'AIFC')) return null;
+    let ch = 0, frames = 0, bits = 0, rate = 0, comp = 'NONE', data = -1;
+    for (let o = 12; o + 8 <= bytes.length;) {
+      const id = tag(o), size = v.getUint32(o + 4), body = o + 8;
+      if (id === 'COMM' && body + 18 <= bytes.length) {
+        ch = v.getUint16(body); frames = v.getUint32(body + 2); bits = v.getUint16(body + 6);
+        const exp = v.getUint16(body + 8) & 0x7fff;
+        rate = (v.getUint32(body + 10) * 2 ** 32 + v.getUint32(body + 14)) * 2 ** (exp - 16383 - 63);
+        if (tag(8) === 'AIFC' && size >= 22) comp = tag(body + 18);
+      } else if (id === 'SSND' && body + 8 <= bytes.length) data = body + 8 + v.getUint32(body);
+      o = body + size + (size & 1);
+    }
+    const float = comp === 'fl32' || comp === 'FL32' || comp === 'fl64' || comp === 'FL64';
+    if (!['NONE', 'twos', 'sowt'].includes(comp) && !float) return null;
+    const bps = float ? (comp.endsWith('64') ? 8 : 4) : Math.ceil(bits / 8);
+    if (!ch || !rate || data < 0 || bps < 1 || bps > 8 || (!float && bps > 4)) return null;
+    frames = Math.min(frames, Math.floor((bytes.length - data) / (bps * ch)), Math.ceil(rate * SAMPLE_MAX_S) + 1);
+    if (frames < 1) return null;
+    const buf = new AudioBuffer({ numberOfChannels: ch, length: frames, sampleRate: rate });
+    const le = comp === 'sowt', scale = 2 ** (bps * 8 - 1);
+    for (let c = 0; c < ch; c++) {
+      const out = buf.getChannelData(c);
+      for (let i = 0, o = data + c * bps; i < frames; i++, o += bps * ch) {
+        if (float) { out[i] = bps === 8 ? v.getFloat64(o) : v.getFloat32(o); continue; }
+        let x = 0;
+        for (let b = 0; b < bps; b++) x = x * 256 + bytes[le ? o + bps - 1 - b : o + b];
+        out[i] = (x >= scale ? x - 2 * scale : x) / scale;
+      }
+    }
+    return buf;
+  }
+  // Bytes → AudioBuffer (throws when it isn't audio). An offline context: no output device needed at launch.
+  async function decodeSample(bytes) {
+    bytes = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+    let buf = null;
+    try { buf = await new OfflineAudioContext(1, 1, 48000).decodeAudioData(bytes.slice().buffer); }
+    catch { try { buf = readAiff(bytes); } catch { buf = null; } }
+    if (!buf || !buf.length) throw new Error('not audio');
+    return buf;
+  }
+  // What plays: mono (the channels averaged, not normalised), the first 2 s, with a 5 ms fade where it was cut.
+  function prepSample(buf) {
+    const max = Math.round(buf.sampleRate * SAMPLE_MAX_S), len = Math.min(buf.length, max), n = buf.numberOfChannels;
+    const d = new Float32Array(len);
+    for (let c = 0; c < n; c++) { const x = buf.getChannelData(c); for (let i = 0; i < len; i++) d[i] += x[i] / n; }
+    if (buf.length > max) { const fade = Math.min(len, Math.round(buf.sampleRate * 0.005)); for (let i = 0; i < fade; i++) d[len - 1 - i] *= i / fade; }
+    const out = new AudioBuffer({ numberOfChannels: 1, length: len, sampleRate: buf.sampleRate });
+    out.copyToChannel(d, 0);
+    return out;
+  }
+  const sampleLabel = (role) => (SOUND_ROLES.find(([r]) => r === role) || [])[1] || role;
+  // Settings → "Custom sample…": the shell's dialog, then decode, then the shell copies it. Resolves { ok } when set,
+  // { canceled }, or { error } with the reason Settings shows under the rows (a refused file changes nothing).
+  async function pickSample(role) {
+    if (!samples.bridge) return { canceled: true };
+    const r = await samples.bridge('pick', role).catch(() => null);
+    if (!r || r.canceled) return { canceled: true };
+    const refuse = (error) => { log('Metronome: ' + sampleLabel(role) + ': ' + error); return { error }; };
+    if (r.error === 'size') return refuse('“' + r.name + '” is larger than 5 MB.');
+    if (r.error || !r.bytes) return refuse('Couldn’t read “' + (r.name || 'the file') + '”.');
+    let buf;
+    try { buf = await decodeSample(r.bytes); }
+    catch {
+      samples.bridge('discard', role).catch(() => null);
+      return refuse('“' + r.name + '” isn’t audio the metronome can play.');
+    }
+    const saved = await samples.bridge('save', role).catch(() => null);
+    if (!saved || !saved.ok) return refuse('Couldn’t copy “' + r.name + '”.');
+    sampleBufs[role] = prepSample(buf);
+    metro.samples[role] = { name: r.name };
+    saveMetro();
+    log('Metronome: ' + sampleLabel(role) + ' plays ' + r.name + (buf.duration > SAMPLE_MAX_S ? ' (first 2 s)' : '') + '.');
+    if (buf.duration > SAMPLE_MAX_S) toast('“' + r.name + '” is trimmed to its first 2 seconds.');
+    return { ok: true };
+  }
+  // Back to the built-in sound (Reset, or a built-in picked from the menu): the shell deletes its copy.
+  async function resetSample(role) {
+    const had = !!metro.samples[role];
+    delete metro.samples[role]; delete sampleBufs[role];
+    saveMetro();
+    if (had && samples.bridge) await samples.bridge('reset', role).catch(() => null);
+  }
+  // At launch: decode every stored sample once. A missing or unreadable one falls back to the built-in sound (the
+  // setting goes back too, so the notice doesn't repeat) with one toast for all of them.
+  async function loadSamples() {
+    const lost = [];
+    for (const [role] of SOUND_ROLES) {
+      if (!metro.samples[role]) { delete sampleBufs[role]; continue; }
+      try {
+        const r = samples.bridge ? await samples.bridge('load', role) : null;
+        if (!r || !r.bytes) throw new Error(r && r.error === 'size' ? 'too large' : 'missing');
+        sampleBufs[role] = prepSample(await decodeSample(r.bytes));
+      } catch (err) {
+        log('Metronome: the custom ' + sampleLabel(role).toLowerCase() + ' sound (' + metro.samples[role].name + ') is ' + (err.message === 'not audio' ? 'unreadable' : err.message) + '; using ' + VOICES[metro.sounds[role]].name + '.');
+        lost.push(role);
+        await resetSample(role);
+      }
+    }
+    if (lost.length) {
+      const names = lost.map(sampleLabel);
+      toast('Couldn\u2019t load the custom metronome sound' + (lost.length > 1 ? 's for ' + names.slice(0, -1).join(', ') + ' and ' + names[names.length - 1] + '; using the built-in ones.' : ' for ' + names[0] + '; using the built-in one.'));
+    }
+    return lost;
+  }
+  function playSample(buf, at, gain) {
+    const src = audio.createBufferSource(); src.buffer = buf;
+    const g = audio.createGain(); g.gain.value = gain;
+    g.connect(voiceOut || audio.destination);
+    src.connect(g); src.start(at);
+    return src;
+  }
+  // The sound source for a role: { id, play(at, gain) }. The role's custom sample when there is one, otherwise its
+  // built-in voice; both through the same context, so the output device and the scheduling are the same.
   function soundFor(role) {
     const m = ROLE_MIX[role];
     if (!m) return null;
-    const v = VOICES[metro.sound] || VOICES.click;
-    return { play: (at, gain) => v.play(at, m.accent, gain, m.pitch) };
+    const buf = sampleBufs[m.sound];
+    if (buf) return { id: 'sample', buffer: buf, play: (at, gain) => playSample(buf, at, gain) };
+    const id = VOICES[metro.sounds[m.sound]] ? metro.sounds[m.sound] : 'click';
+    return { id, play: (at, gain) => VOICES[id].play(at, m.accent, gain, m.pitch) };
   }
+  // One click at `at`. Clicks don't overlap: the one still sounding is cut where this one starts (its own gain node
+  // fades to 0 over 5 ms, a sample's source stops there), so long sounds never ring over each other. A muted or
+  // silent event cuts nothing. Returns the gain, the sound id and the click (the scheduler hangs its info on it).
+  const CUT_S = 0.005;
+  let sounding = null;   // { out, node, at, info }
   function click(at, role) {
-    metro.lastVoice = VOICES[metro.sound] ? metro.sound : 'click';
     const src = soundFor(role), gain = roleGain(role);
-    if (src && gain > 0) src.play(at, gain);
-    return gain;
+    if (src) metro.lastVoice = src.id;
+    if (!src || gain <= 0) return { gain, sound: src ? src.id : null, handle: null };
+    if (sounding && at > sounding.at) {
+      sounding.out.gain.setValueAtTime(1, at);
+      sounding.out.gain.linearRampToValueAtTime(0, at + CUT_S);
+      if (sounding.node) sounding.node.stop(at + CUT_S);
+      if (sounding.info) sounding.info.cut = at + CUT_S;
+    }
+    const out = audio.createGain();
+    out.connect(audio.destination);
+    voiceOut = out;
+    let node = null;
+    try { node = src.play(at, gain) || null; } finally { voiceOut = null; }
+    sounding = { out, node, at, info: null };
+    return { gain, sound: src.id, handle: sounding };
   }
-  function previewSound() { ensureAudio(); click(audio.currentTime + 0.03, ROLE.ACCENT); click(audio.currentTime + 0.33, ROLE.NORMAL); }
+  // Settings ▶: one click of that sound (accent | main | sub) at its level.
+  function previewSound(role) { ensureAudio(); click(audio.currentTime + 0.03, role === 'accent' ? ROLE.ACCENT : role === 'sub' ? ROLE.SUB : ROLE.NORMAL); }
 
   // Scheduler state: the current bar's events (all layers merged, sorted) and a cursor (the time
   // and beat offset of the last scheduled point), so a tempo change applies from the next event.
@@ -853,8 +1064,9 @@
       const at = cursorAt + (ev.offsetBeats - cursorOff) * spb;
       if (at >= horizon) return;
       cursorAt = at; cursorOff = ev.offsetBeats; evI++;
-      const gain = click(at, ev.role);
-      const info = { bar: barIdx, countIn: metro.countingIn, offsetBeats: ev.offsetBeats, role: ev.role, layer: ev.layer, bpm: effectiveBpm(), gain: r6(gain) };
+      const { gain, sound, handle } = click(at, ev.role);
+      const info = { bar: barIdx, countIn: metro.countingIn, offsetBeats: ev.offsetBeats, role: ev.role, layer: ev.layer, bpm: effectiveBpm(), gain: r6(gain), sound, at };
+      if (handle) handle.info = info;
       metro.scheduled.push(info);
       if (metro.scheduled.length > 512) metro.scheduled.shift();
       if (ev.layer) continue;   // the indicator follows the first layer
@@ -874,7 +1086,7 @@
   function startMetro() {
     if (metro.running) return;
     ensureAudio();
-    metro.running = true; metro.beat = -1; metro.sub = -1; metro.count = 0; metro.bar = 0; metro.scheduled = [];
+    metro.running = true; metro.beat = -1; metro.sub = -1; metro.count = 0; metro.bar = 0; metro.scheduled = []; sounding = null;
     metro.rampFrom = effectiveBpm();
     barIdx = 0; cursorAt = audio.currentTime + 0.05;
     planBar();
@@ -1154,7 +1366,10 @@
   window.__metro = {
     state: metro, start: startMetro, stop: stopMetro, tap: tapTempo, setBpm, setMode: setMetroMode, listOutputs, VOICES,
     ROLE, PATTERNS: METRO_PATTERNS, patternCells, barEvents: metroBarEvents, rampBpm: metroRampBpm, normSetup, effectiveBpm, soundFor, roleGain,
+    // Custom samples: the decoded buffers, the AIFF reader, and the test's bridge (setting it runs the launch-time load).
+    samples: { buffers: sampleBufs, decode: decodeSample, readAiff, setBridge: (b) => { samples.bridge = b; return loadSamples(); } },
   };
+  if (samples.bridge) loadSamples();
   ui.metroBarEvents = metroBarEvents;   // the pure event generator, for tests (window.__ui)
 
   // ------------------------------------------------------------------ preset tempo
@@ -1255,237 +1470,102 @@
     return coreOnC305ForTempo.apply(this, [event, ...rest]);
   };
 
-  // Device-originated parameter changes use more than one message shape. The
-  // The legacy control report (type 26) carries raw amp/capture/gate values;
-  // contextual reports that cannot be mapped locally fall back to the existing
-  // state/FX/cab readers. Keep the high-frequency paths local.
-  const LIVE_PARAMETER_REPORT = 26;
-  const LIVE_FX_PARAMETER_REPORT = 99;
-  const DEVICE_STATE_CHANGED = 31;
-  const PRESET_DIRTY_REPORT = 115;
-  const CONTEXT_PARAMETER_REPORTS = new Set([94]); // cab parameter frames without a safe target
-  const LIVE_CONTROL_IDS = {
-    0x00: ['amp', 'gain'],
-    0x01: ['amp', 'level'],
-    0x02: ['amp', 'bass'],
-    0x03: ['amp', 'mid'],
-    0x04: ['amp', 'treble'],
-    0x0A: ['capture', 'volume'],
-    0x0B: ['gate', 'reduction'],
+  // Live reports from the pedal (knobs, footswitch bypasses, the expression pedal) are applied in pro/live-sync.js.
+  // The UI's part: a bypass click the pedal hasn't confirmed yet wins over an older report, and a local edit of an
+  // expression target stays until the pedal moves again.
+  NanoLive.hooks.keepLocalBypass = (key, enabled) => {
+    const pending = ui.pendingBypassTargets.get(key);
+    return !!pending && pending.preset === Number(state.selectedPreset) && pending.on !== enabled;
   };
-  let pedalStateRefreshTimer = null;
-  let pedalStateRefreshPending = false;
-  let recentLiveFXParameter = null;
-  // Only the pedal's dirty report drives the save UI. These values are display
-  // state for expression overlays and write ordering, never a dirty model.
-  let expressionBoundaryPreset = null;
+  NanoLive.hooks.expressionMoved = () => ui.expressionLocalOverrides.clear();
+  NanoLive.hooks.stateRead = () => { if (ui.presetUnknown) { ui.presetUnknown = false; ui.sideSig = ''; render(); } };
+  NanoLive.hooks.afterExpression = () => restoreExpressionLocalOverrides();
+
+  function clearPendingIRSlotTarget(target = ui.pendingIRSlotTarget) {
+    if (!target) return;
+    clearTimeout(target.timer);
+    if (ui.pendingIRSlotTarget === target) ui.pendingIRSlotTarget = null;
+  }
+
+  function holdIRSlotTargetForPreview() {
+    const target = ui.pendingIRSlotTarget;
+    if (!target) return;
+    target.holdForPreviewStop = true;
+    clearTimeout(target.timer);
+    target.timer = null;
+  }
+
+  function releaseIRSlotTargetWhenPreviewFails() {
+    const target = ui.pendingIRSlotTarget;
+    if (!target || !target.holdForPreviewStop || irAudition.active) return;
+    target.holdForPreviewStop = false;
+    target.timer = setTimeout(() => settlePendingIRSlotTarget(target), 2500);
+  }
+
+  function settleIRSlotTargetAfterPreview() {
+    const target = ui.pendingIRSlotTarget;
+    if (!target || !target.holdForPreviewStop) return;
+    if (target.preset !== Number(state.selectedPreset)) {
+      clearPendingIRSlotTarget(target);
+      return;
+    }
+    state.cabIR.fromLibrary = false;
+    state.cabIR.on = target.slot > 0;
+    state.cabIR.selectedSlot = target.slot;
+    state.cabIR.stateSlot = target.slot;
+    if (target.slot > 0) state.cabIR.lastActiveSlot = target.slot;
+    if (target.currentIR) state.currentIR = { ...target.currentIR };
+    clearPendingIRSlotTarget(target);
+    render();
+  }
+
+  function settlePendingIRSlotTarget(target) {
+    if (ui.pendingIRSlotTarget !== target) return;
+    clearPendingIRSlotTarget(target);
+    render();
+  }
 
   function beginExpressionBoundary() {
-    ui.expressionBaseline = null;
-    ui.expressionBaselineBoundary = true;
+    ui.clearOverridesOnRead = true;
     ui.expressionLocalOverrides.clear();
-    expressionBoundaryPreset = null;
     ui.pendingBypassTargets.clear();
     ui.bypassWriteGeneration++;
+    clearPendingIRSlotTarget();
   }
 
-  const captureDbFromRaw = (raw) => raw <= 128 ? ((raw / 128) * 24) - 24 : ((raw - 128) / 127) * 12;
-
-  function pedalStateReadBusy() {
-    return state.stateMode !== 'idle' || state.pendingParamBlock || state.paramRefreshQueue.length || state.fileBusy ||
-      gattWriteQueue.length || gattWritePumpRunning;
-  }
-
-  function runPedalStateRefresh() {
-    pedalStateRefreshTimer = null;
-    if (!pedalStateRefreshPending || !state.connected) {
-      pedalStateRefreshPending = false;
-      return;
-    }
-    if (state.protocol.presetLoad) {
-      pedalStateRefreshPending = false; // the preset load already includes an authoritative state read
-      return;
-    }
-    if (pedalStateReadBusy()) {
-      pedalStateRefreshTimer = setTimeout(runPedalStateRefresh, 100);
-      return;
-    }
-    pedalStateRefreshPending = false;
-    log('Pedal state changed; refreshing the current preset');
-    requestCurrentPresetState();
-  }
-
-  function schedulePedalStateRefresh() {
-    if (!state.connected || state.protocol.presetLoad) return;
-    pedalStateRefreshPending = true;
-    if (pedalStateRefreshTimer !== null) clearTimeout(pedalStateRefreshTimer);
-    pedalStateRefreshTimer = setTimeout(runPedalStateRefresh, 120);
-  }
-
-  function fixed32Float(entry) {
-    if (!entry || entry.wire !== 5 || !entry.raw || entry.raw.length !== 4) return null;
-    const value = new DataView(Uint8Array.from(entry.raw).buffer).getFloat32(0, true);
-    return Number.isFinite(value) ? value : null;
-  }
-
-  function applyLiveFXParameterReport(data) {
-    if (frameType(data) !== LIVE_FX_PARAMETER_REPORT) return false;
-
-    const fields = parseProtoFields(data.slice(2, data.length - 4));
-    const reportEntry = fields[1] && fields[1][0];
-    if (!reportEntry || reportEntry.wire !== 0 || reportEntry.value !== 1) return false;
-
-    const blockEntry = fields[3] && fields[3][0];
-    const paramEntry = fields[4] && fields[4][0];
-    const valueEntry = fields[5] && fields[5][0];
-    if ((blockEntry && blockEntry.wire !== 0) || (paramEntry && paramEntry.wire !== 0) ||
-      (valueEntry && valueEntry.wire !== 5)) return false;
-
-    // These are protobuf fields, so the pedal omits the zero-valued block,
-    // parameter index, and value. Slot 0 / parameter 0 / raw value 0 are the
-    // defaults represented by an absent field.
-    const blockSlot = blockEntry ? blockEntry.value : 0;
-    const paramIndex = paramEntry ? paramEntry.value : 0;
-    const raw = valueEntry ? fixed32Float(valueEntry) : 0;
-    if (!Number.isInteger(blockSlot) || blockSlot < 0 || blockSlot >= FX_BLOCK_KEYS.length ||
-      !Number.isInteger(paramIndex) || paramIndex < 0 || raw === null || raw < 0 || raw > 255) return false;
-
-    const blockKey = FX_BLOCK_KEYS[blockSlot];
-    const block = state.blocks[blockKey];
-    const param = block && block.params && block.params[paramIndex];
-    if (!param) return false;
-
-    const next = normalizedToParamValue(param, raw / 255);
-    recentLiveFXParameter = { raw, at: Date.now() };
-    if (param.value !== next) {
-      param.value = next;
-      render();
-    }
-    return true;
-  }
-
-  function applyLiveFXEnableReport(data) {
-    if (frameType(data) !== DEVICE_STATE_CHANGED) return false;
-
-    const fields = parseProtoFields(data.slice(2, data.length - 4));
-    const reportEntry = fields[1] && fields[1][0];
-    const slotEntry = fields[3] && fields[3][0];
-    const stateEntry = fields[4] && fields[4][0];
-    if (!reportEntry || reportEntry.wire !== 0 || reportEntry.value !== 1 ||
-      !slotEntry || slotEntry.wire !== 0 ||
-      (stateEntry && stateEntry.wire !== 0)) return false;
-
-    // Enable slots 4..8 correspond to Pre FX 1..2 and Post FX 1..3. A
-    // missing field 4 is protobuf's default zero, which means enabled.
-    const stateValue = stateEntry ? stateEntry.value : 0;
-    if (stateValue !== 0 && stateValue !== 1) return false;
-    const blockKey = FX_BLOCK_KEYS.find(key => blockSlotConfig[key] && blockSlotConfig[key].enableSlot === slotEntry.value);
-    const block = blockKey && state.blocks[blockKey];
-    if (!block) return false;
-
-    const enabled = stateValue === 0;
-    const pending = ui.pendingBypassTargets.get(blockKey);
-    if (pending && pending.preset === Number(state.selectedPreset) && pending.on !== enabled) return true;
-    if (block.on !== enabled) {
-      block.on = enabled;
-      render();
-    }
-    return true;
-  }
-
-  function applyLiveParameterReport(data) {
-    if (frameType(data) !== LIVE_PARAMETER_REPORT) return false;
-
-    const fields = parseProtoFields(data.slice(2, data.length - 4));
-    const reportEntry = fields[1] && fields[1][0];
-    const markerEntry = fields[6] && fields[6][0];
-    if (!reportEntry || reportEntry.wire !== 0 || reportEntry.value !== 1 ||
-      !markerEntry || markerEntry.wire !== 0 || markerEntry.value !== 1) return false;
-
-    const idEntry = fields[3] && fields[3][0];
-    if (idEntry && idEntry.wire !== 0) return false;
-    // Gain is control ID 0. Protobuf omits that field when its value is zero,
-    // so a normal gain report has no field 3 at all.
-    const controlId = idEntry ? idEntry.value : 0;
-    if (!LIVE_CONTROL_IDS[controlId]) {
-      const valueEntry = fields[4] && fields[4][0];
-      const raw = valueEntry ? valueEntry.value : 0;
-      if (controlId === 0x06 && recentLiveFXParameter && Date.now() - recentLiveFXParameter.at < 250 && raw === Math.round(recentLiveFXParameter.raw)) {
-        recentLiveFXParameter = null;
-        return true;
-      }
-      return false;
-    }
-
-    // Protobuf omits a zero-valued field 4, so `... 18 03 30 01 ...`
-    // means Mid = 0 rather than a malformed packet.
-    const valueEntry = fields[4] && fields[4][0];
-    if (valueEntry && valueEntry.wire !== 0) return false;
-    const raw = clamp(valueEntry ? valueEntry.value : 0, 0, 255);
-    const [kind, key] = LIVE_CONTROL_IDS[controlId];
-    let changed = false;
-
-    if (kind === 'amp') {
-      if (state.amp[key] !== raw) { state.amp[key] = raw; changed = true; }
-    } else if (kind === 'capture') {
-      const db = captureDbFromRaw(raw);
-      if (state.captureVolumeDb !== db) { state.captureVolumeDb = db; changed = true; }
-    } else if (kind === 'gate') {
-      const reduction = clamp(raw - 108, 0, 100);
-      if (state.gate.params[0].value !== reduction) { state.gate.params[0].value = reduction; changed = true; }
-    }
-
-    if (changed) render();
-    return true;
-  }
-
-  const coreOnC305ForLiveParameters = window.onC305;
+  // A preset change on the pedal (footswitch): local edits, unconfirmed clicks and auditions belong to the old preset.
+  const coreOnC305ForPresetChange = window.onC305;
   window.onC305 = function (event, ...rest) {
-    try {
-      const v = event && event.target && event.target.value;
-      const data = v && v.buffer ? new Uint8Array(v.buffer, v.byteOffset || 0, v.byteLength || v.buffer.byteLength) : null;
-      if (data) {
-        const type = frameType(data);
-        if (type === MSG.SetPresetSlotsRequest) beginExpressionBoundary();
-        if (type === MSG.ExpressionPedalPositionChanged) {
-          const fields = framePayloadFields(data);
-          const selector = fields[3] && fields[3][0] && fields[3][0].value;
-          if (selector === 2 && !(state.exp && state.exp.pending)) {
-            ui.expressionLocalOverrides.clear();
-          }
-        }
-        if (type === LIVE_FX_PARAMETER_REPORT) {
-          // Type 99 carries the effect slot, parameter index, and a fixed32
-          // raw value (0..255), so it can update the affected block directly.
-          // Unknown effects/parameters fall back to the authoritative refresh.
-          if (!applyLiveFXParameterReport(data)) schedulePedalStateRefresh();
-        } else if (type === LIVE_PARAMETER_REPORT) {
-          // Known raw controls update immediately; an unknown control ID still
-          // falls through to the core and remains visible in the protocol log.
-          if (!applyLiveParameterReport(data)) schedulePedalStateRefresh();
-        } else if (type === DEVICE_STATE_CHANGED) {
-          // Contextual type-31 reports identify the exact FX enable slot and
-          // bypass state, so update that block without waiting for a full read.
-          // Generic type-31 notifications are coalesced by the core handler;
-          // avoid starting a second refresh from this UI wrapper.
-          applyLiveFXEnableReport(data);
-        } else if (type === PRESET_DIRTY_REPORT) {
-          // The core has already made state.presetDirty authoritative. Do not
-          // infer a different state or start a read from this notification.
-        } else if (CONTEXT_PARAMETER_REPORTS.has(type)) {
-          // These messages do not carry enough context to safely identify the
-          // affected FX/cab parameter. One coalesced state read supplies it.
-          schedulePedalStateRefresh();
-        }
-      }
-    } catch (err) { log('ERROR: live parameter report: ' + err.message); }
-    const result = coreOnC305ForLiveParameters.apply(this, [event, ...rest]);
-    // The core handler remains the protocol owner, but its contextual type-31
-    // path applies the incoming state synchronously. Reassert the latest local
-    // click after it returns so a delayed report cannot undo the optimistic UI.
-    if (applyPendingBypassTargets()) render();
-    return result;
+    const d = NanoLive.exactBytes(event);
+    if (d && frameType(d) === MSG.SetPresetSlotsRequest) { beginExpressionBoundary(); endAuditionsAfterPedalPresetChange(); }
+    return coreOnC305ForPresetChange.apply(this, [event, ...rest]);
   };
+
+  // Edits on their way to the pedal. Its dirty report (115) comes after an edit lands, so a prompt right after an
+  // edit would see a clean preset: an edit write queued or in flight, or sent less than 300 ms ago with no 115 since,
+  // counts as unsaved for the "Save changes to …?" prompts (isDirtyNow). The mark in the header stays the pedal's.
+  const EDIT_WRITE_TYPES = new Set([26, 28, 31, 62, 94, 95, 99, 136]);   // knobs, slots, bypass, expression, cab, FX, models
+  const editWrites = { inFlight: 0, lastSentAt: 0, lastReportAt: 0 };
+  const isEditWrite = (p) => {
+    const type = p && p.length >= 6 ? frameType(p) : null;
+    return EDIT_WRITE_TYPES.has(type) || (type === TEMPO_MSG && p[2] === 0x18 && p[3] === 0);   // tempo: the preset's, not the live one
+  };
+  const coreWriteC304 = window.writeC304;
+  window.writeC304 = function (label, payload) {
+    if (!isEditWrite(payload)) return coreWriteC304.apply(this, arguments);
+    editWrites.inFlight++;
+    return coreWriteC304.apply(this, arguments).then((ok) => {
+      editWrites.inFlight--;
+      if (ok) editWrites.lastSentAt = Date.now();
+      return ok;
+    });
+  };
+  const coreTypedForDirty = window.handleTypedMessage;
+  window.handleTypedMessage = function (data) {
+    if (frameType(data) === MSG.PresetDirtyStateChanged) editWrites.lastReportAt = Date.now();
+    return coreTypedForDirty.apply(this, arguments);
+  };
+  const editPending = () => editWrites.inFlight > 0 || (editWrites.lastSentAt > editWrites.lastReportAt && Date.now() - editWrites.lastSentAt < 300);
 
   // A preset switch drops unsaved edits on the pedal, a pending tempo commit included.
   const coreSelectPreset = window.selectPreset;
@@ -1569,6 +1649,7 @@
   window.__tempo = { state: tempo, frame: tempoFrame, live: tempoLive, commit: tempoCommit, tap: tempoTap, setFollow: setFollowPreset };
 
   // ------------------------------------------------------------------ pedal library
+  let irLibraryQuery = '';
   async function ensureLibrary() {
     if (state.library.loaded) return true;
     requestLibraryContent();
@@ -1576,9 +1657,189 @@
     while (!state.library.loaded && Date.now() - t0 < 6000) await new Promise(r => setTimeout(r, 100));
     return state.library.loaded;
   }
+
+  function applyIRLibrarySearch(root) {
+    const query = irLibraryQuery.trim().toLowerCase();
+    let visible = 0;
+    root.querySelectorAll('.cab-library-group').forEach(group => {
+      let groupVisible = 0;
+      group.querySelectorAll('.library-row').forEach(row => {
+        const match = !query || row.dataset.search.includes(query);
+        row.hidden = !match;
+        if (match) groupVisible++;
+      });
+      group.hidden = groupVisible === 0;
+      visible += groupVisible;
+    });
+    const empty = root.querySelector('.library-empty');
+    if (empty) {
+      const loaded = state.library.loaded;
+      empty.hidden = loaded && visible > 0;
+      if (!loaded) empty.textContent = state.connected ? 'Reading the pedal library…' : 'Connect your Nano Cortex to read its library.';
+      else if (query) empty.textContent = 'Nothing matches “' + irLibraryQuery.trim() + '”.';
+      else empty.textContent = 'No cabs or IRs are available in the pedal library.';
+    }
+  }
+
+  // Built again only when the library or an audition changed (the inspector redraws on every report). The query is
+  // applied to the rows in place, so typing never rebuilds it; the same input keeps its focus and caret.
+  let irLibraryCache = { sig: '', node: null };
+  function irLibrarySection() {
+    const lib = state.library;
+    const sig = JSON.stringify([state.connected, lib.loaded, ui.uploading, ui.previewBusy,
+      irAudition.busy, irAudition.stopping, irAudition.active && [irAudition.active.kind, irAudition.active.index],
+      irAudition.pending && [irAudition.pending.kind, irAudition.pending.index],
+      ...['irFactory', 'irUser'].map(k => (lib[k] || []).map(x => x.index + ':' + x.name).join('|'))]);
+    if (irLibraryCache.node && irLibraryCache.sig === sig) return irLibraryCache.node;
+    const old = irLibraryCache.node && irLibraryCache.node.querySelector('.cab-library-search');
+    const caret = old && document.activeElement === old ? [old.selectionStart, old.selectionEnd] : null;
+    const root = el('div', { class: 'cab-library-content' });
+    irLibraryCache = { sig, node: root };
+    const search = el('input', {
+      class: 'search cab-library-search', type: 'search', placeholder: 'Search cabs and IRs', dataset: { fk: 'cab-lib-search' },
+      'aria-label': 'Search cabs and IRs', autocomplete: 'off', spellcheck: 'false', value: irLibraryQuery,
+      oninput: (e) => { irLibraryQuery = e.currentTarget.value; applyIRLibrarySearch(root); },
+    });
+    const groups = [
+      ['irFactory', 'Factory cabs', state.library.irFactory || []],
+      ['irUser', 'Your IRs', state.library.irUser || []],
+    ];
+    const list = el('div', { class: 'cab-library-groups' });
+    for (const [kind, label, items] of groups) {
+      if (!items.length) continue;
+      const grid = el('div', { class: 'library-grid' });
+      for (const item of items) {
+        const details = [label, item.type, item.instrument, item.author, NanoText.captureDescription(item.description), ...(item.tags || [])].filter(Boolean).join(' · ');
+        const isActive = () => Boolean(irAudition.active && irAudition.active.kind === kind && irAudition.active.index === item.index);
+        const isPending = () => Boolean(irAudition.pending && irAudition.pending.kind === kind && irAudition.pending.index === item.index);
+        const row = el('div', {
+          class: 'library-row' + (isActive() ? ' previewing' : ''),
+          dataset: { search: [item.name, details].join(' ').toLowerCase() },
+          title: details || item.name,
+          oncontextmenu: (e) => contextMenu(e, [
+            {
+              label: isActive() ? 'Stop preview' : 'Preview',
+              disabled: !state.connected || !state.library.loaded || ui.uploading || ui.previewBusy || irAudition.busy,
+              action: () => isActive() ? stopIRPreview() : startIRPreview({ kind, index: item.index, name: item.name }),
+            },
+            {
+              label: 'Load into slot…',
+              disabled: !state.connected || !state.library.loaded || ui.uploading,
+              action: () => loadFromLibrary('cab', { kind, index: item.index, name: item.name }),
+            },
+            ...(kind === 'irUser' ? ['-', {
+              label: 'Delete…', danger: true,
+              disabled: !state.connected || !state.library.loaded || ui.uploading || ui.previewBusy || irAudition.busy,
+              action: () => deleteLibraryIR({ ...item, kind }),
+            }] : []),
+          ]),
+        });
+        const pick = el('button', {
+          class: 'library-item', type: 'button', disabled: !state.connected || !state.library.loaded,
+          'aria-label': 'Choose a slot for ' + item.name,
+          onclick: () => loadFromLibrary('cab', { kind, index: item.index, name: item.name }),
+        }, el('span', { text: item.name }));
+        const previewIcon = sv('svg', { class: 'library-preview-icon', viewBox: '0 0 16 16', 'aria-hidden': 'true', focusable: 'false' });
+        previewIcon.append(isActive()
+          ? sv('path', { d: 'M4 3h8v10H4z', fill: 'currentColor' })
+          : sv('path', { d: 'M5 3v10l8-5z', fill: 'currentColor' }));
+        const preview = el('button', {
+          class: 'library-preview' + (isActive() ? ' playing' : ''), type: 'button',
+          disabled: !state.connected || !state.library.loaded || irAudition.busy,
+          'aria-pressed': String(isActive()),
+          'aria-label': isActive() ? 'Stop preview of ' + item.name : 'Preview ' + item.name,
+          title: isPending() ? 'Starting preview' : isActive() && irAudition.stopping ? 'Stopping preview' : (isActive() ? 'Stop preview' : 'Audition without loading into a slot'),
+          onclick: () => isActive() ? stopIRPreview() : startIRPreview({ kind, index: item.index, name: item.name }),
+        }, isPending() ? el('span', { class: 'library-preview-pending', 'aria-hidden': 'true', text: '…' }) : previewIcon);
+        row.append(pick, preview);
+        grid.append(row);
+      }
+      list.append(el('div', { class: 'cab-library-group' }, el('h4', { text: label }), grid));
+    }
+    const empty = el('p', { class: 'library-empty' });
+    root.append(search, list, empty);
+    applyIRLibrarySearch(root);
+    if (caret) search.setSelectionRange(caret[0], caret[1]);   // rebuilt while typing: the caret stays where it was
+    return root;
+  }
+
+  let cabIRLoadId = 0;
+  function queueCabIRLoad(item, preselectedSlot = 0) {
+    if (ui.cabIRLoadPaused) {
+      toast('The last IR load was not confirmed. Reconnect the pedal before loading another IR.');
+      return;
+    }
+    const job = {
+      id: ++cabIRLoadId,
+      kind: item.kind,
+      index: item.index,
+      name: item.name,
+      preselectedSlot: Number(preselectedSlot) || 0,
+      slot: null,
+      phase: 'queued',
+    };
+    const queued = Boolean(ui.cabIRLoadActive || ui.cabIRLoadQueue.length);
+    ui.cabIRLoadQueue.push(job);
+    if (queued) toast('Queued ' + item.name + '. It will load after the current IR change.');
+    render();
+    startNextCabIRLoad();
+  }
+
+  function startNextCabIRLoad() {
+    if (ui.cabIRLoadPaused || ui.cabIRLoadActive || !ui.cabIRLoadQueue.length) return;
+    const job = ui.cabIRLoadQueue.shift();
+    ui.cabIRLoadActive = job;
+    job.phase = 'choosing';
+    ui.slotPreselect = job.preselectedSlot;
+    render();
+
+    const current = (state.library[job.kind] || []).find(candidate => candidate.index === job.index);
+    if (!current || !sameName(current.name, job.name)) {
+      toast('The pedal IR library changed. Refresh it and try again.');
+      void finishCabIRLoad(job, false);
+      return;
+    }
+
+    Promise.resolve(loadLibraryCab(job.kind, job.index)).then(slot => {
+      if (ui.cabIRLoadActive !== job || job.finishing) return;
+      if (slot) {
+        if (ui.demo) demo.pickIR(slot);
+        void finishCabIRLoad(job, true);
+        return;
+      }
+      const pending = state.pendingCabAssignment;
+      const uncertain = job.slot && pending && pending.slot === job.slot && sameName(pending.name, job.name);
+      if (uncertain) {
+        state.pendingCabAssignment = null;
+        ui.cabIRLoadPaused = true;
+        ui.cabIRLoadTimedOut = job;
+        ui.cabIRLoadQueue.length = 0;
+        toast('The pedal did not confirm this IR change. Reconnect before trying another IR.');
+      }
+      void finishCabIRLoad(job, false, { acknowledged: job.responseReceived, timeout: uncertain });
+    }).catch(err => {
+      if (ui.cabIRLoadActive !== job || job.finishing) return;
+      log('ERROR: loading library IR: ' + err.message);
+      toast('Could not load ' + job.name + ' into a pedal slot.');
+      void finishCabIRLoad(job, false);
+    });
+  }
+
+  async function finishCabIRLoad(job, success, { acknowledged = false, timeout = false } = {}) {
+    if (ui.cabIRLoadActive !== job || job.finishing) return;
+    job.finishing = true;
+    job.phase = success ? 'activating' : timeout ? 'unconfirmed' : 'failed';
+    render();
+    if (success) toast('Cab ' + job.name + ' loaded into slot ' + job.slot);
+    else if (!acknowledged && !timeout && job.slot) toast('Could not confirm loading ' + job.name + ' into a slot.');
+    ui.slotPreselect = 0;
+    ui.cabIRLoadActive = null;
+    render();
+    startNextCabIRLoad();
+  }
+
   // `slot`: load the pick straight into that slot (from a slot button's menu) instead of asking.
   async function openLibraryPicker(kind, anchor, slot) {
-    ui.slotPreselect = slot || 0;
     if (pop) { closePopover(); return; }
     if (!state.library.loaded) {
       toast('Reading the library on the pedal…');
@@ -1600,22 +1861,105 @@
       placeholder: isCap ? 'Search captures' : 'Search cabs and IRs',
       items, isCurrent: (m) => sameName(m.name, curName),
       emptyText: (q) => (items.length ? 'Nothing matches “' + q + '”.' : 'The pedal’s library is empty.'),
-      onPick: (m) => loadFromLibrary(kind, m),
+      onPick: (m) => loadFromLibrary(kind, m, slot || 0),
     });
   }
-  async function loadFromLibrary(kind, item) {
-    const slot = kind === 'capture' ? await loadLibraryCapture(item.kind, item.index) : await loadLibraryCab(item.kind, item.index);
+  async function loadFromLibrary(kind, item, preselectedSlot = 0) {
+    if (kind === 'cab') {
+      queueCabIRLoad(item, preselectedSlot);
+      return;
+    }
+    if (preselectedSlot) ui.captureSlotPreselect = Number(preselectedSlot) || 0;
+    let slot;
+    try {
+      slot = await loadLibraryCapture(item.kind, item.index);
+    } finally {
+      ui.captureSlotPreselect = 0;
+    }
     if (!slot) { render(); return; }
-    if (ui.demo) (kind === 'capture' ? demo.pickCapture : demo.pickIR)(slot);
-    toast((kind === 'capture' ? 'Capture ' : 'Cab ') + item.name + ' loaded into slot ' + slot);
+    if (ui.demo) demo.pickCapture(slot);
+    toast('Capture ' + item.name + ' loaded into slot ' + slot);
     render();
   }
+
+  // Delete a user IR from the pedal's library: 82 { 1: 2, 4: { 1: index, 2: name } } → 83 { 1: 6, 3: 1 }
+  // (docs/INVESTIGATION.md §6a). The library is read again right before the delete, and the index must still hold
+  // this IR: library indices shift when an IR is added or removed.
+  function irSlotsHolding(name) {
+    const slots = [];
+    for (let i = 1; i <= irSlotCount(); i++) if (sameName(state.irNames.get(i), name)) slots.push(i);
+    return slots;
+  }
+  async function deleteLibraryIR(item) {
+    if (!state.connected || !item || item.kind !== 'irUser' || !Number.isInteger(item.index)) return;
+    if (ui.uploading || NanoTransfer.busy || ui.previewBusy || irAudition.busy) {
+      toast('Finish the current pedal action before deleting an IR.');
+      return;
+    }
+    const slots = irSlotsHolding(item.name);
+    const playing = activeIRSlot();
+    const where = state.cabIR.fromLibrary && sameName(state.currentIR.shortName, item.name)
+      ? ' The current preset plays it straight from the library.'
+      : slots.length ? ' It is loaded in IR slot ' + slots.join(' and ') + (slots.includes(playing) ? ', which the current preset uses' : '') + '. Check ' + (slots.length > 1 ? 'those slots' : 'that slot') + ' afterwards.' : '';
+    const choice = await modal({
+      title: 'Delete IR “' + item.name + '” from the pedal?',
+      body: 'This permanently removes the IR from the Nano Cortex library. There is no undo.' + where,
+      buttons: [{ id: 'cancel', label: 'Cancel' }, { id: 'ok', label: 'Delete', primary: true }],
+    });
+    if (choice !== 'ok') { render(); return; }
+    if (!(await stopAnyAudition('deleting the IR'))) return;
+
+    ui.uploading = true;
+    ui.lastAction = 'Checking the pedal library…';
+    renderStatus();
+    let current = null, reply = null;
+    try {
+      state.library.loaded = false;
+      state.library.requested = false;
+      if (await ensureLibrary()) current = state.library.irUser.find(candidate => candidate.index === item.index);
+      if (current && sameName(current.name, item.name)) {
+        const nameBytes = Array.from(new TextEncoder().encode(current.name));
+        const record = [0x08, ...encodeVarint(current.index), 0x12, ...encodeVarint(nameBytes.length), ...nameBytes];
+        const frame = buildFrame([0x08, 0x02, 0x22, ...encodeVarint(record.length), ...record], NanoLive.MSG.DeleteLibraryIRRequest);
+        ui.lastAction = 'Deleting IR ' + current.name;
+        renderStatus();
+        reply = await writeAndAwait('Delete IR ' + current.name, frame, NanoLive.MSG.DeleteLibraryIRResponse);
+      }
+    } finally {
+      ui.uploading = false;
+      ui.lastAction = '';
+      render();
+    }
+    if (!current || !sameName(current.name, item.name)) {
+      toast(state.library.loaded
+        ? 'The pedal’s IR library changed: “' + item.name + '” is no longer where it was. Nothing was deleted.'
+        : 'Could not read the pedal’s IR library, so nothing was deleted. Try again.');
+      return;
+    }
+    if (!reply || fieldValue(reply, 3) !== 1) {
+      toast('The pedal did not confirm deleting ' + current.name + '.');
+      return;
+    }
+
+    state.library.loaded = false;
+    state.library.requested = false;
+    const refreshed = await ensureLibrary();
+    if (!refreshed) {
+      state.library.irUser = state.library.irUser.filter(candidate => candidate.index !== current.index);
+    }
+    render();
+    toast(refreshed
+      ? current.name + ' deleted from the pedal IR library.'
+      : current.name + ' deleted, but the pedal IR list could not be refreshed.');
+  }
+  window.__deleteLibraryIR = deleteLibraryIR;
 
   // ------------------------------------------------------------------ slot usage scan
   // Parity with the native app: step through every saved preset, note the capture and cab slot each one
   // plays (or that it plays one straight from the library), then go back to the preset we started on.
   // Switching presets discards unsaved edits, so the scan refuses to start while there are any.
-  const isDirtyNow = () => pedalDirtyForUI();
+  const isDirtyNow = () => pedalDirtyForUI() || editPending();
+  window.__isDirtyForPrompt = isDirtyNow;
   const presetLabel = (n) => n + ' ' + presetName(n);
   const usersOf = (kind, slot) => (ui.usage && (kind === 'capture' ? ui.usage.captures : ui.usage.cabs)[slot]) || [];
   const scanTime = () => (ui.usage ? ui.usage.date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '');
@@ -1638,6 +1982,7 @@
   async function scanUsage() {
     if (ui.scanning || !state.connected) return;
     if (isDirtyNow()) { toast('Save or discard your edits first: the scan switches presets.'); return; }
+    if (!(await stopAnyAudition('the scan'))) return;
     ui.scanning = true; ui.scanStop = false;
     const origin = state.selectedPreset;
     const todo = [];
@@ -1732,7 +2077,7 @@
     if (ui.scanning) { toast('Wait for the slot usage scan to finish.'); ui.sideSig = ''; render(); return; }
     ui.pendingPreset = null;
     ui.sideSig = ''; // repaint the list either way (undoes a keyboard highlight if cancelled)
-    if (n === state.selectedPreset && state.connected) { render(); return; }
+    if (n === state.selectedPreset && state.connected && !ui.presetUnknown) { render(); return; }
     if (isDirtyNow() && state.connected) {
       const choice = await modal({
         title: 'Save changes to ' + presetName(state.selectedPreset) + '?',
@@ -1746,6 +2091,7 @@
       if (choice === 'cancel' || !choice) { render(); return; }
       if (choice === 'save') await doSave();
     }
+    if (!(await stopAnyAudition('the preset switch'))) { ui.sideSig = ''; render(); return; }
     await selectPreset(n);
     if (ui.demo) demo.load(n);
     render();
@@ -1761,11 +2107,16 @@
     }
     ui.connectError = '';
     ui.connecting = true;
+    wrapRequestDevice();
     render();
     try {
       await connectAll();
     } finally {
       ui.connecting = false;
+      ble.autoWhy = '';
+      closeBleChooser();
+      if (ble.restart) { ble.restart = false; if (!state.connected && !ui.demo) doConnect(); }   // Scan again, Show all, or choose again
+      else ble.next = null;
       render();
     }
   }
@@ -1773,6 +2124,7 @@
   // Turn Web Bluetooth's raw errors into what to do next.
   function friendlyConnectError(msg) {
     const hint = window.__bleHint; window.__bleHint = null; // set by the desktop shell's device picker
+    if (hint === 'auto-none' && ble.autoWhy === 'wake') return 'Your Nano Cortex didn\u2019t show up after the computer woke up. Power it on (and close Cortex Cloud on your phone), then click Connect.';
     if (hint === 'auto-none') return 'Your Nano Cortex didn\u2019t show up at launch. Power it on (and close Cortex Cloud on your phone), then click Connect.';
     if (hint === 'none-found') return 'No Nano Cortex showed up nearby. Check that it\u2019s powered on and that Cortex Cloud on your phone isn\u2019t connected to it, then try again.';
     if (/adapter not available|bluetooth.*(off|unavailable)/i.test(msg)) return 'Bluetooth is off or unavailable on this computer. Turn it on and try again.';
@@ -1782,6 +2134,223 @@
     return 'Couldn\u2019t connect: ' + msg;
   }
 
+  // ------------------------------------------------------------------ Bluetooth chooser (desktop app)
+  // The shell's picker (src/bt-picker.js) answers requestDevice(): it takes the remembered pedal or the first device
+  // that advertises the Nano's service by itself, and otherwise has this chooser drawn. The page tells it, right
+  // before each requestDevice(), what the scan is for (bt-request, which answers with the scan mode), and afterwards
+  // how connecting went: only 'ok' (C304/C305 found) remembers the device (issue #15).
+  //   'nano' scan: requestDevice() filtered on the Nano's services, so nothing else is listed.
+  //   'all' scan: every device nearby (the fallback, "Show all Bluetooth devices").
+  // Without the shell (tests, the web preview) choices and results are only collected in __ble.
+  const ble = {
+    next: null,        // options for the next requestDevice(): { want, auto, choose, notice }
+    restart: false,    // start another scan once the current attempt has ended
+    mode: 'nano',
+    attempt: { noService: 0, otherService: 0, accessible: 0 },
+    chooser: null,     // { bg, list, status, view }
+    choices: [], results: [],
+  };
+  window.__ble = ble;
+  const BLE_SERVICES = typeof SERVICE_UUIDS !== 'undefined' ? SERVICE_UUIDS : [];
+
+  // ------------------------------------------------------------------ releasing the Bluetooth link
+  // The page lets go of the pedal whenever it decides it is disconnected: the link dropped (gattserverdisconnected),
+  // a write found it gone, an explicit Disconnect, a connect that failed half-way, the computer going to sleep. It
+  // calls gatt.disconnect() on the device it had, even when Chromium already reports it disconnected, and keeps no
+  // reference to it. Before every new requestDevice() an older device object that still reports a connection is
+  // disconnected as well. (2026-10-20→23: the editor showed "Disconnected" for two days while macOS still held a
+  // link to the pedal; the pedal stopped advertising, and Connect found nothing until the app quit.)
+  ble.devices = new Set();   // device objects a requestDevice() returned that may still hold a link
+  ble.requests = [];         // the options of each requestDevice() (`next`), for the UX test
+  function releaseDevice(device) {
+    if (!device) return;
+    try { device.removeEventListener('gattserverdisconnected', window.onDisconnected); } catch { /* not an EventTarget */ }
+    const open = !!(device.gatt && device.gatt.connected);
+    try { if (device.gatt) device.gatt.disconnect(); } catch (err) { log('ERROR: releasing the Bluetooth link: ' + err.message); }
+    const still = !!(device.gatt && device.gatt.connected);
+    if (still) ble.devices.add(device);   // tried again before the next scan
+    else ble.devices.delete(device);
+    log('Bluetooth link to ' + (device.name || 'the device') + ' released' + (still ? ', but it still reports a connection (tried again before the next scan)' : open ? ' (it was still open)' : '') + '.');
+  }
+  // The page is disconnected now (setStatus 'Disconnected'): release the device it had and drop every reference.
+  function releaseLink() {
+    const device = state.device;
+    state.device = null; state.server = null; state.c304 = null; state.c305 = null;
+    if (device) releaseDevice(device);
+  }
+  // Right before a scan: any device object from before that still reports a connection.
+  function releaseOldDevices() {
+    if (state.device && !state.connected) releaseLink();
+    for (const device of [...ble.devices]) {
+      if (device === state.device) continue;
+      if (device.gatt && device.gatt.connected) releaseDevice(device);
+      else ble.devices.delete(device);
+    }
+  }
+  // A write that failed because the link is gone (no gattserverdisconnected came, or not yet): disconnected, and
+  // released like any other disconnect. A write refused while the link is still up changes nothing.
+  let writeFailPending = false;
+  function writeFailed(err) {
+    if (ui.demo || !state.connected || writeFailPending) return;
+    const d = state.device;
+    const gone = !d || !d.gatt || !d.gatt.connected || /disconnected|not connected/i.test(String((err && err.message) || err));
+    if (!gone) return;
+    writeFailPending = true;
+    setTimeout(() => {   // after the core's "ERROR: BLE write failed" line
+      writeFailPending = false;
+      if (!state.connected || ui.demo) return;
+      log('The Bluetooth link is gone (a write failed); disconnecting.');
+      window.onDisconnected();
+    }, 0);
+  }
+  // Every requestDevice() goes through here: the release above first, then (in the desktop app) the shell's picker is
+  // told what the scan is for. ble.requestDevice is the browser's; the UX test puts a fake pedal there. Installed at
+  // boot and again before each connect (a browser that gains navigator.bluetooth later, the UX test on Linux).
+  function wrapRequestDevice() {
+    const bt = navigator.bluetooth;
+    if (!bt || !bt.requestDevice || bt.requestDevice.__nano) return;
+    if (!ble.requestDevice) ble.requestDevice = bt.requestDevice.bind(bt);
+    const wrapped = (options) => {
+      releaseOldDevices();
+      ble.requests.push(Object.assign({}, ble.next || {}));
+      let opts = options;
+      if (shellBridge && shellBridge.bluetoothRequest) {
+        const next = ble.next || {};
+        ble.next = null;
+        ble.mode = shellBridge.bluetoothRequest(next) === 'all' ? 'all' : 'nano';
+        if (ble.mode !== 'all' && BLE_SERVICES.length) opts = { filters: BLE_SERVICES.map(s => ({ services: [s] })), optionalServices: BLE_SERVICES };
+      }
+      return Promise.resolve(ble.requestDevice(opts)).then((device) => { if (device) ble.devices.add(device); return device; });
+    };
+    wrapped.__nano = true;
+    bt.requestDevice = wrapped;
+  }
+  wrapRequestDevice();
+  // A new scan from the shell (after a device turned out not to be a Nano, with a user gesture) or from the
+  // chooser's buttons. While an attempt is running it is cancelled first and the scan starts when it has ended.
+  window.__connectAgain = (opts) => {
+    if (state.connected || ui.demo) return false;
+    ble.next = Object.assign({}, opts);
+    if (ui.connecting) ble.restart = true; else doConnect();
+    return true;
+  };
+  function bleChoose(choice) {
+    ble.choices.push(choice);
+    if (shellBridge && shellBridge.bluetoothChoose) shellBridge.bluetoothChoose(choice).catch(() => {});
+  }
+  function bleResult(kind) {
+    ble.results.push(kind);
+    if (shellBridge && shellBridge.bluetoothResult) shellBridge.bluetoothResult(kind).catch(() => {});
+  }
+  // From the core's log lines for one connect attempt: did the device answer "no such service" (not a Nano), or did
+  // something else go wrong (a dropped link proves nothing)?
+  function bleTrack(text) {
+    const a = ble.attempt;
+    if (/^Requesting Nano Cortex/.test(text)) Object.assign(a, { noService: 0, otherService: 0, accessible: 0 });
+    else if (/^Service accessible/.test(text)) a.accessible++;
+    else if (/^Service unavailable /.test(text)) { if (/No Services matching/i.test(text)) a.noService++; else a.otherService++; }
+    else if (/^Connect failed:/.test(text)) {
+      const msg = text.replace(/^Connect failed:\s*/, '');
+      bleResult(/cancel/i.test(msg) ? 'cancelled'
+        : /C304\/C305 not found/.test(msg) && !a.otherService && (a.noService || a.accessible) ? 'no-service' : 'failed');
+      Object.assign(a, { noService: 0, otherService: 0, accessible: 0 });
+    }
+  }
+
+  function closeBleChooser() {
+    const c = ble.chooser;
+    if (!c) return;
+    ble.chooser = null;
+    c.bg.remove();
+    document.removeEventListener('keydown', c.onKey, true);
+    if (c.prev && c.prev.isConnected) c.prev.focus({ preventScroll: true });
+  }
+  // The user's answer: a device id, or 'cancel' / 'rescan' / 'all'.
+  function bleChooserAction(what) {
+    const c = ble.chooser;
+    if (!c) return;
+    const mode = c.view.mode;
+    closeBleChooser();
+    if (what === 'rescan' || what === 'all') {
+      window.__connectAgain({ want: what === 'all' ? 'all' : mode, choose: true });
+      bleChoose(what);
+    } else bleChoose(what === 'cancel' ? '' : what);
+  }
+  const unnamedLabel = (id) => 'Unnamed device · …' + String(id).replace(/[^0-9a-z]/gi, '').slice(-4).toUpperCase();
+  // view from the shell: { open, mode, scanning, notice, devices: [{ id, name, nano, remembered, notNano }] }, in order.
+  function showBleChooser(view) {
+    if (!view || !view.open) { closeBleChooser(); return; }
+    let c = ble.chooser;
+    if (!c) {
+      const list = el('div', { class: 'bt-list', role: 'listbox', 'aria-label': 'Bluetooth devices', dataset: { fk: 'bt-list' } });
+      const status = el('div', { class: 'bt-status', dataset: { fk: 'bt-status' } });
+      const title = el('h2', { dataset: { fk: 'bt-title' } });
+      const notice = el('p', { class: 'warn bt-notice', dataset: { fk: 'bt-notice' } });
+      const allBtn = el('button', { class: 'btn', dataset: { fk: 'bt-all' }, onclick: () => bleChooserAction('all') }, 'Show all Bluetooth devices');
+      const btns = el('div', { class: 'row' }, allBtn, el('span', { class: 'grow' }),
+        el('button', { class: 'btn', dataset: { fk: 'bt-rescan' }, onclick: () => bleChooserAction('rescan') }, 'Scan again'),
+        el('button', { class: 'btn', dataset: { fk: 'bt-cancel' }, onclick: () => bleChooserAction('cancel') }, 'Cancel'));
+      const kbd = (t) => el('kbd', { text: t });
+      const bg = el('div', { class: 'modal-bg bt-bg', onclick: (e) => { if (e.target === bg) bleChooserAction('cancel'); } },
+        el('div', { class: 'modal bt-chooser', role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'btTitle', dataset: { fk: 'bt-chooser' } },
+          title, notice,
+          el('p', { class: 'bt-hint', dataset: { fk: 'bt-hint' } }, 'Put the Nano Cortex in pairing mode: hold ', kbd('EXIT'), ' + ', kbd('CAPTURE'),
+            ' for about a second, until the Gain ring lights up. Close Cortex Cloud on your phone first; the pedal takes one connection at a time.'),
+          status, list, btns));
+      title.id = 'btTitle';
+      const onKey = (e) => {
+        if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); bleChooserAction('cancel'); return; }
+        if (e.key === 'Tab') {   // keep focus inside
+          const f = [...bg.querySelectorAll('button:not(:disabled)')];
+          const i = f.indexOf(document.activeElement);
+          e.preventDefault();
+          if (f.length) f[(i + (e.shiftKey ? -1 : 1) + f.length) % f.length].focus();
+        }
+        e.stopPropagation();
+      };
+      c = ble.chooser = { bg, list, status, title, notice, allBtn, onKey, prev: document.activeElement, rows: new Map(), view };
+      document.addEventListener('keydown', onKey, true);
+      document.body.append(bg);
+    }
+    c.view = view;
+    const devices = view.devices || [];
+    const nanoScan = view.mode === 'nano';
+    c.title.textContent = nanoScan ? 'Looking for your Nano Cortex' : 'Choose your Nano Cortex';
+    c.notice.textContent = view.notice === 'not-nano' ? 'That device isn’t a Nano Cortex: it has no Nano Cortex service. Pick another one.' : '';
+    c.allBtn.hidden = !nanoScan;
+    const n = devices.length;
+    const count = n === 1 ? '1 device' : n + ' devices';
+    c.status.replaceChildren(el('span', { class: 'led' + (view.scanning ? ' busy' : '') }), el('span', { text: nanoScan
+      ? (view.scanning ? 'Scanning for the Nano Cortex…' : 'Scan finished. Scan again, or show all Bluetooth devices.')
+      : (view.scanning ? 'Scanning… ' + count + ' nearby.' : 'Scan finished: ' + count + '. Scan again to keep looking.') }));
+    // Rows are kept per device and moved, not rebuilt, so a click isn't lost when the list updates under it.
+    const scroll = c.list.scrollTop;
+    const keep = new Set(devices.map(d => d.id));
+    for (const [id, row] of c.rows) if (!keep.has(id)) { row.remove(); c.rows.delete(id); }
+    const rows = devices.map((d, i) => {
+      let row = c.rows.get(d.id);
+      if (!row) {
+        row = el('button', { class: 'bt-row', role: 'option', onclick: () => bleChooserAction(row.dataset.id) });
+        c.rows.set(d.id, row);
+      }
+      row.dataset.id = d.id;
+      row.dataset.fk = 'bt-dev-' + i;
+      row.className = 'bt-row' + (d.nano ? ' nano' : '') + (d.notNano ? ' not-nano' : '') + (d.name ? '' : ' unnamed');
+      const tag = d.notNano ? 'Not a Nano Cortex' : d.remembered ? 'Last used' : d.nano ? 'Looks like a Nano Cortex' : '';
+      row.title = d.name ? d.name : 'This device doesn’t broadcast a name. On Windows the Nano Cortex often shows up like this.';
+      row.replaceChildren(...[el('span', { class: 'name', text: d.name || unnamedLabel(d.id) }), tag ? el('span', { class: 'tag', text: tag }) : null].filter(Boolean));
+      return row;
+    });
+    const empty = !n ? el('div', { class: 'bt-empty', dataset: { fk: 'bt-empty' } }, nanoScan
+      ? 'Nothing yet. Only devices that offer the Nano Cortex’s Bluetooth service appear here, and the pedal is picked as soon as it does.'
+      : 'No Bluetooth devices yet.') : null;
+    c.list.replaceChildren(...rows, ...(empty ? [empty] : []));
+    c.list.scrollTop = scroll;
+    if (!c.bg.contains(document.activeElement)) (rows[0] || c.bg.querySelector('[data-fk="bt-cancel"]')).focus({ preventScroll: true });
+  }
+  window.__bleChooser = { show: showBleChooser, close: closeBleChooser, action: bleChooserAction };
+  if (shellBridge && shellBridge.onBluetoothChooser) shellBridge.onBluetoothChooser(showBleChooser);
+
   // ------------------------------------------------------------------ captures from Cortex Cloud
   // The shell hands over { cns: base64, meta } when "Send to Nano Cortex" is clicked on
   // a capture page in the Cloud tab. Confirm, stream it to the pedal, refresh the
@@ -1789,7 +2358,7 @@
   async function receiveCapture(bundle) {
     const meta = bundle.meta || {};
     if (!state.connected) { toast('Connect your Nano Cortex first, then send ' + (meta.name || 'the capture') + ' again.'); return false; }
-    if (ui.uploading) { toast('A capture is already being sent.'); return false; }
+    if (ui.uploading || NanoTransfer.busy) { toast('Another transfer to the pedal is still running. Try again when it has finished.'); return false; }
     const cns = typeof bundle.cns === 'string' ? Uint8Array.from(atob(bundle.cns), c => c.charCodeAt(0)) : Uint8Array.from(bundle.cns);
     const choice = await modal({
       title: 'Send ' + meta.name + ' to the pedal?',
@@ -1827,6 +2396,444 @@
   window.__uploadCapture = receiveCapture;
   if (window.nanoCloud && window.nanoCloud.onCapture) window.nanoCloud.onCapture(receiveCapture);
 
+  async function receiveCloudIR(bundle) {
+    const transferId = String(bundle && bundle.transferId || '');
+    const meta = bundle && bundle.meta || {};
+    const name = String(meta.name || 'Cloud impulse response');
+    let outcome = { ok: false, name };
+    try {
+      if (!state.connected) {
+        const error = 'Connect your Nano Cortex first, then send ' + name + ' again.';
+        toast(error);
+        outcome.error = error;
+        return outcome;
+      }
+      if (ui.uploading || NanoTransfer.busy) {
+        const error = 'Another transfer to the pedal is still running. Try again when it has finished.';
+        toast(error);
+        outcome.error = error;
+        return outcome;
+      }
+      if (ui.previewBusy || ui.previewing || irAudition.busy || irAudition.active) {
+        const error = 'Stop the active preview before sending a Cloud IR.';
+        toast(error);
+        outcome.error = error;
+        return outcome;
+      }
+      if (!await ensureLibrary()) {
+        const error = 'Could not read the Nano Cortex IR library. Refresh it and try again.';
+        toast(error);
+        outcome.error = error;
+        return outcome;
+      }
+      const existingIR = [...(state.library.irUser || []), ...(state.library.irFactory || [])]
+        .find(item => sameName(item.name, name));
+      if (existingIR) {
+        toast(existingIR.name + ' is already in IRs on pedal.');
+        outcome = { ok: true, alreadyOnNano: true, name: existingIR.name, index: existingIR.index, refreshed: true };
+        return outcome;
+      }
+      if (typeof bundle.wav !== 'string' || !bundle.wav) throw new Error('The Cloud IR download has no WAV data.');
+      // The shell already checked the WAV (src/cloud-ir.js); these guard the bridge.
+      if (bundle.wav.length > 1400000) throw new Error('The IR is larger than 1 MB.');
+      const wav = Uint8Array.from(atob(bundle.wav), c => c.charCodeAt(0));
+      if (wav.length < 44 || String.fromCharCode(...wav.slice(0, 4)) !== 'RIFF' || String.fromCharCode(...wav.slice(8, 12)) !== 'WAVE') {
+        throw new Error('The Cloud IR download is not a WAV file.');
+      }
+      if (!meta.productId || !meta.filename || !/\.wav$/i.test(meta.filename)) throw new Error('The Cloud IR download is missing its product ID or WAV filename.');
+
+      // No transfer timeout in the shell while the user decides.
+      const irStatus = (phase) => { if (transferId && window.nanoCloud && window.nanoCloud.impulseResponseStatus) window.nanoCloud.impulseResponseStatus(transferId, phase); };
+      irStatus('confirming');
+      const choice = await modal({
+        title: 'Send ' + name + ' to the pedal?',
+        body: (wav.length / 1024).toFixed(1) + ' KB over Bluetooth. This adds it to “IRs on pedal”; it does not change any preset slot.',
+        buttons: [{ id: 'cancel', label: 'Cancel' }, { id: 'send', label: 'Send IR', primary: true }],
+      });
+      if (choice !== 'send') {
+        render();
+        outcome.cancelled = true;
+        return outcome;
+      }
+
+      irStatus('sending');
+      ui.uploading = true;
+      ui.lastAction = 'Sending IR ' + name;
+      renderStatus();
+      let reply;
+      try {
+        reply = await NanoTransfer.downloadImpulseResponse({ wav, meta }, (i, n) => {
+          ui.lastAction = 'Sending IR ' + name + ': ' + i + ' / ' + n;
+          renderStatus();
+        });
+      } finally {
+        ui.uploading = false;
+        ui.lastAction = '';
+        render();
+      }
+      if (!reply.ok) {
+        const error = 'The pedal refused ' + name + (reply.message ? ': ' + reply.message : '.');
+        toast(error);
+        outcome.error = error;
+        return outcome;
+      }
+
+      // type 16 gives the assigned user-IR index. Re-read type 77 so the
+      // editor's “IRs on pedal” section immediately contains the new item.
+      state.library.loaded = false;
+      const refreshed = await ensureLibrary();
+      render();
+      const libraryItem = refreshed
+        ? state.library.irUser.find(item => item.index === reply.index) || state.library.irUser.find(item => sameName(item.name, reply.name || name))
+        : null;
+      const pedalName = libraryItem && libraryItem.name || reply.name || name;
+      if (libraryItem) {
+        toast(pedalName + ' is now in IRs on pedal.');
+      } else {
+        toast(pedalName + ' was sent to the pedal, but its IR list did not refresh. Use Refresh to reload it.');
+      }
+      outcome = { ok: true, name: pedalName, index: reply.index, refreshed: !!libraryItem };
+      return outcome;
+    } catch (err) {
+      const error = 'Cloud IR transfer failed: ' + String(err && err.message || err);
+      toast(error);
+      outcome.error = error;
+      return outcome;
+    } finally {
+      if (transferId && window.nanoCloud && window.nanoCloud.completeImpulseResponse) {
+        window.nanoCloud.completeImpulseResponse(transferId, outcome);
+      }
+    }
+  }
+  window.__receiveCloudIR = receiveCloudIR;
+  if (window.nanoCloud && window.nanoCloud.onImpulseResponse) window.nanoCloud.onImpulseResponse(receiveCloudIR);
+
+  // ------------------------------------------------------------------ auditions (from #14)
+  // Two ways to hear something on the pedal without storing it: a Cortex Cloud capture (150 → 151, "Live Preview" in
+  // the Cloud toolbar) and a library IR (158 → 159, the play button in the Cab / IR inspector). Both end with
+  // 148 → 149 (pro/transfer.js stopAudition) and are kept alive with 91 every 20 s. Anything that saves or changes the
+  // preset stops them first (stopAnyAudition); docs/INVESTIGATION.md §12.
+  const MSG_IR_PREVIEW = 158, MSG_IR_PREVIEW_REPLY = 159;
+
+  // The Cloud toolbar's Live Preview button mirrors this; every exit path pushes it, so the button never sticks.
+  let previewToolbar = { active: false, name: '', error: '', phase: 'idle' };
+  function notifyPreviewState(active, name = '', error = '', phase = null) {
+    previewToolbar = { active: !!active, name: name || '', error: error || '', phase: phase || (active ? 'active' : 'idle') };
+    if (shellBridge && shellBridge.previewState) shellBridge.previewState(previewToolbar);
+    syncAuditionState();
+  }
+  // The shell holds a quit while anything is auditioned (src/quit-guard.js), so it is told at once whenever that
+  // changes: from here and from render(), which every audition change calls (not from the drawing itself, which waits
+  // for an animation frame and doesn't run while the Cloud tab hides this page).
+  var auditionSyncReady;   // var: render() may run before the audition state below is set up
+  let auditionShown = false;
+  function syncAuditionState() {
+    if (!auditionSyncReady) return;
+    const now = auditioning();
+    if (now === auditionShown) return;
+    auditionShown = now;
+    if (shellBridge && shellBridge.auditionState) shellBridge.auditionState(now);
+  }
+  window.__auditionShown = () => auditionShown;   // what the shell was last told (UX test)
+  // The toolbar state from what is true now (a start or stop in flight shows as starting / stopping).
+  function pushPreviewState(error = '') {
+    const phase = ui.previewBusy ? (ui.previewing ? 'stopping' : 'starting') : ui.previewing ? 'active' : 'idle';
+    notifyPreviewState(ui.previewing, ui.previewing || ui.previewBusy ? ui.previewName : '', error, phase);
+  }
+  window.__previewToolbar = () => previewToolbar;   // for the UX test
+  window.__pushPreviewState = () => pushPreviewState();   // the shell asks after refusing a preview request
+
+  let lastCabIRStateSignature = '';
+  function notifyCabIRState(force = false) {
+    if (!shellBridge || !shellBridge.cabIRState) return;
+    const cabState = { connected: !!state.connected, on: !!(state.connected && state.cabIR.on) };
+    const signature = cabState.connected + ':' + cabState.on;
+    if (!force && signature === lastCabIRStateSignature) return;
+    lastCabIRStateSignature = signature;
+    shellBridge.cabIRState(cabState);
+  }
+
+  function captureBytes(bundle) {
+    return typeof bundle.cns === 'string'
+      ? Uint8Array.from(atob(bundle.cns), c => c.charCodeAt(0))
+      : Uint8Array.from(bundle.cns || []);
+  }
+
+  const irAudition = { active: null, pending: null, busy: false, stopping: false };
+  let cabMicPositionWritePromise = Promise.resolve(true);
+  function irAuditioning() {
+    return Boolean(irAudition.busy || irAudition.pending || irAudition.active);
+  }
+  const auditioning = () => Boolean(ui.previewing || ui.previewBusy || irAuditioning());
+  auditionSyncReady = true;
+
+  // While anything is auditioned the pedal wants type 91 about every 20 s (it answers 92); without it the audition
+  // ends after about a minute. One timer for both kinds; it runs until the last audition is confirmed stopped.
+  const PREVIEW_KEEP_ALIVE_MS = 20000;
+  const PREVIEW_KEEP_ALIVE_TYPE = 91;
+  let previewKeepAliveTimer = null;
+  let previewKeepAliveInFlight = false;
+
+  function stopPreviewKeepAlive() {
+    if (previewKeepAliveTimer !== null) {
+      clearInterval(previewKeepAliveTimer);
+      previewKeepAliveTimer = null;
+      log('Live preview keep-alive stopped.');
+    }
+    previewKeepAliveInFlight = false;
+  }
+
+  async function sendPreviewKeepAlive() {
+    if ((!ui.previewing && !irAudition.active) || !state.connected || previewKeepAliveInFlight) return;
+    previewKeepAliveInFlight = true;
+    try {
+      const ok = await writeC304('Preview keep-alive', buildFrame([0x08, 0x03], PREVIEW_KEEP_ALIVE_TYPE));
+      if (!ok && (ui.previewing || irAudition.active)) log('ERROR: Preview keep-alive write failed.');
+    } finally {
+      previewKeepAliveInFlight = false;
+    }
+  }
+
+  function startPreviewKeepAlive() {
+    if (previewKeepAliveTimer !== null) return;
+    log('Live preview keep-alive started (every ' + (PREVIEW_KEEP_ALIVE_MS / 1000) + ' s).');
+    previewKeepAliveTimer = setInterval(() => { void sendPreviewKeepAlive(); }, PREVIEW_KEEP_ALIVE_MS);
+  }
+  const stopKeepAliveIfIdle = () => { if (!ui.previewing && !irAudition.active) stopPreviewKeepAlive(); };
+
+  // 158: factory cabs and user IRs use different record fields (3 and 4); field 8 = 1 in every observed Play.
+  function irPreviewRequest(item) {
+    const nameBytes = Array.from(new TextEncoder().encode(item.name));
+    const record = [0x08, ...encodeVarint(item.index), 0x12, ...encodeVarint(nameBytes.length), ...nameBytes];
+    const recordField = item.kind === 'irFactory' ? 0x1A : 0x22;
+    return buildFrame([recordField, ...encodeVarint(record.length), ...record, 0x40, 0x01], MSG_IR_PREVIEW);
+  }
+  window.__irPreviewRequest = irPreviewRequest;
+
+  async function startIRPreview(item) {
+    if (!state.connected || !state.library.loaded) return false;
+    if (irAudition.busy || ui.previewBusy || ui.uploading || NanoTransfer.busy) return false;
+    if (!item || !Number.isInteger(item.index) || !item.name) return false;
+    if (ui.previewing && !(await stopCapturePreview({ quiet: true }))) { toast('The live preview could not be stopped, so ' + item.name + ' was not previewed.'); return false; }
+
+    irAudition.busy = true;
+    irAudition.pending = item;
+    irAudition.stopping = false;
+    render();
+    try {
+      // Finish a mic/position write queued before the audition so it cannot reach the pedal after the Play.
+      await cabMicPositionWritePromise;
+      const reply = await writeAndAwait('Preview IR "' + item.name + '"', irPreviewRequest(item), MSG_IR_PREVIEW_REPLY);
+      const status = fieldValue(reply, 3);
+      if (!reply || status !== 1) {
+        log('IR preview rejected: type 159 index=' + item.index + ' status=' + status);
+        toast('The pedal did not accept the IR preview.');
+        return false;
+      }
+      irAudition.active = { kind: item.kind, index: item.index, name: item.name };
+      holdIRSlotTargetForPreview();
+      startPreviewKeepAlive();
+      log('IR preview accepted: type 159 index=' + item.index + ' status=' + status);
+      return true;
+    } catch (err) {
+      log('ERROR: IR preview: ' + err.message);
+      toast('IR preview failed: ' + err.message);
+      return false;
+    } finally {
+      irAudition.busy = false;
+      irAudition.pending = null;
+      releaseIRSlotTargetWhenPreviewFails();
+      render();
+    }
+  }
+
+  // The official app reads the state after a stop; the pedal may then report the preset dirty (115).
+  async function refreshAfterIRPreviewStop() {
+    if (!state.connected) return;
+    if (!(await NanoLive.readCurrentState(6000))) log('IR preview stopped; the current preset state could not be read.');
+  }
+
+  // true once the pedal confirmed the stop (149 with this transaction and status 1). Otherwise nothing changes: the
+  // IR may still be playing, so it stays marked active and the keep-alive keeps running.
+  async function stopIRPreview({ quiet = false, reread = true } = {}) {
+    if (!irAudition.active) return !irAudition.busy;
+    if (irAudition.busy) return false;
+    if (!state.connected) return false;
+    irAudition.busy = true;
+    irAudition.stopping = true;
+    render();
+    let result = null, error = '';
+    try {
+      result = await NanoTransfer.stopAudition('ir');
+    } catch (err) {
+      error = err.message;
+      log('ERROR: stopping IR preview: ' + err.message);
+    } finally {
+      irAudition.busy = false;
+      irAudition.stopping = false;
+    }
+    if (!result || !result.ok) {
+      if (!quiet) toast('The pedal did not confirm stopping the IR preview' + (error ? ': ' + error : '.') + ' It may still be playing.');
+      render();
+      return false;
+    }
+    irAudition.active = null;
+    stopKeepAliveIfIdle();
+    render();
+    if (reread) await refreshAfterIRPreviewStop();
+    settleIRSlotTargetAfterPreview();
+    return true;
+  }
+
+  window.__previewIR = startIRPreview;
+  window.__stopIRPreview = stopIRPreview;
+
+  // The official Cloud app's Play button sends the capture to a temporary audition cache. It is intentionally not
+  // the library upload above: no user-capture record or slot is created or changed.
+  async function receivePreview(bundle) {
+    const meta = (bundle && bundle.meta) || {};
+    const name = meta.name || 'capture';
+    const refuse = (error) => { if (error) toast(error); pushPreviewState(error); render(); return false; };
+    if (!state.connected) return refuse('Connect your Nano Cortex first, then preview ' + name + '.');
+    if (ui.uploading || NanoTransfer.busy) return refuse('Another transfer to the pedal is still running. Try again when it has finished.');
+    if (ui.previewBusy || irAudition.busy) return refuse('Wait for the current preview to start or stop, then try again.');
+    if (irAudition.active && !(await stopIRPreview({ quiet: true }))) return refuse('The IR preview could not be stopped, so ' + name + ' was not previewed.');
+    if (ui.previewing && !(await stopCapturePreview({ quiet: true }))) return refuse('The current live preview could not be stopped, so ' + name + ' was not previewed.');
+    let cns;
+    try { cns = captureBytes(bundle); } catch { return refuse('The capture download is unreadable.'); }
+
+    ui.previewBusy = true;
+    ui.previewName = name;
+    ui.lastAction = 'Preparing live preview: ' + name;
+    pushPreviewState();
+    renderStatus();
+    let reply = null, error = '';
+    try {
+      reply = await NanoTransfer.previewCapture({ cns, meta }, (i, n) => {
+        ui.lastAction = 'Previewing ' + name + ': sending ' + i + ' / ' + n;
+        renderStatus();
+      });
+    } catch (err) {
+      error = 'Live preview failed: ' + err.message;
+    }
+    ui.previewBusy = false;
+    ui.lastAction = '';
+    if (!reply || !reply.ok || !state.connected) {
+      ui.previewName = '';
+      return refuse(error || (state.connected ? 'The pedal refused the live preview' + (reply && reply.message ? ': ' + reply.message : '.') : ''));
+    }
+    ui.previewing = true;
+    ui.previewName = name;
+    startPreviewKeepAlive();
+    pushPreviewState();
+    toast('Previewing ' + name + '. Click Stop Preview to end it.');
+    render();
+    return true;
+  }
+
+  // After a confirmed stop the state is read again, as the official app does (and as after an IR audition): while the
+  // pedal plays a preview its state reports the previewed capture, so without a read the editor kept showing that
+  // capture's name after the stop (seen in the native edition on the pedal, 2026-10-24); the read shows the preset's own.
+  async function refreshAfterCapturePreviewStop() {
+    if (!state.connected) return;
+    if (!(await NanoLive.readCurrentState(6000))) log('Live preview stopped; the current preset state could not be read.');
+  }
+
+  // true once the pedal confirmed the stop. Otherwise the preview stays marked active (it may still be playing),
+  // the keep-alive keeps running, and the toolbar shows Stop Preview again. reread: false skips the state read
+  // (quitting).
+  async function stopCapturePreview({ quiet = false, reread = true } = {}) {
+    if (!ui.previewing) { if (!ui.previewBusy) pushPreviewState(); return !ui.previewBusy; }
+    if (ui.previewBusy) return false;
+    if (!state.connected) return false;
+    ui.previewBusy = true;
+    ui.lastAction = 'Stopping live preview';
+    pushPreviewState();
+    renderStatus();
+    let result = null, error = '';
+    try {
+      result = await NanoTransfer.stopAudition('capture');
+    } catch (err) {
+      error = err.message;
+    }
+    ui.previewBusy = false;
+    ui.lastAction = '';
+    if (!result || !result.ok) {
+      const message = 'The pedal did not confirm stopping the live preview' + (error ? ': ' + error : '.') + ' It may still be playing.';
+      if (!quiet) toast(message);
+      pushPreviewState(quiet ? '' : message);
+      render();
+      return false;
+    }
+    ui.previewing = false;
+    ui.previewName = '';
+    stopKeepAliveIfIdle();
+    pushPreviewState();
+    if (!quiet) toast('Live preview stopped.');
+    render();
+    if (reread) await refreshAfterCapturePreviewStop();
+    return true;
+  }
+
+  // Every action that saves or changes the preset (Save, Save as, switching, Discard, Rename, Delete, footswitch
+  // assignment, the slot scan, reordering, deleting an IR) first ends any audition and waits for the pedal's 149.
+  // If the stop isn't confirmed the action is refused: the pedal may still be playing the audition.
+  async function stopAnyAudition(action) {
+    if (!auditioning()) return true;
+    if (ui.previewBusy || irAudition.busy) { toast('A preview is starting or stopping. Try ' + action + ' again in a moment.'); return false; }
+    const ok = (!ui.previewing || await stopCapturePreview({ quiet: true })) && (!irAudition.active || await stopIRPreview({ quiet: true }));
+    if (!ok) toast('The pedal did not confirm stopping the preview, so ' + action + ' did not happen. Stop the preview and try again.');
+    return ok;
+  }
+  window.__stopAnyAudition = stopAnyAudition;
+  window.__auditioning = auditioning;
+
+  // Quitting during an audition (src/quit-guard.js): the shell holds the quit and runs this, which ends whatever is
+  // auditioned (148) and waits for the pedal's 149. The shell waits at most 1.5 s and quits either way. A start or
+  // stop already on its way finishes first; no state read afterwards.
+  async function stopAuditionsForQuit() {
+    if (!auditioning()) return { active: false, ok: true };
+    if (!state.connected) return { active: true, ok: false };
+    if (ui.previewBusy || irAudition.busy) await waitUntil(() => !ui.previewBusy && !irAudition.busy, 1400);
+    const capture = !ui.previewing || await stopCapturePreview({ quiet: true, reread: false });
+    const ir = !irAudition.active || await stopIRPreview({ quiet: true, reread: false });
+    return { active: true, ok: capture && ir && !auditioning() };
+  }
+  window.__stopAuditionsForQuit = stopAuditionsForQuit;
+
+  // The pedal switched presets itself (footswitch) during an audition: end it anyway (the stop is sent, best effort)
+  // and forget it, so the keep-alive stops and the toolbar and inspector don't show an audition of the old preset.
+  function endAuditionsAfterPedalPresetChange() {
+    if (!auditioning()) return;
+    log('The pedal changed presets during a preview; ending the preview.');
+    for (const [kind, active] of [['capture', ui.previewing], ['ir', !!irAudition.active]]) {
+      if (active) NanoTransfer.stopAudition(kind).catch(err => log('Preview stop after a preset change: ' + err.message));
+    }
+    ui.previewing = false; ui.previewName = '';
+    irAudition.active = null;
+    stopPreviewKeepAlive();
+    if (ui.pendingIRSlotTarget) clearPendingIRSlotTarget();
+    pushPreviewState();
+    toast('The pedal switched presets, so the preview ended.');
+    render();
+  }
+
+  window.__previewCapture = receivePreview;
+  window.__stopCapturePreview = stopCapturePreview;
+  if (window.nanoCloud && window.nanoCloud.onPreview) window.nanoCloud.onPreview(receivePreview);
+
+  window.__getCabIRState = () => ({ connected: !!state.connected, on: !!(state.connected && state.cabIR.on) });
+  window.__toggleCabIR = async function () {
+    if (!state.connected) {
+      const error = 'Connect your Nano Cortex before toggling Cab / IR.';
+      toast(error); notifyCabIRState(true); return { ok: false, error };
+    }
+    const on = !Boolean(state.cabIR.on);
+    await selectCabIRSlot(on ? (state.cabIR.lastActiveSlot || 1) : 0);
+    render();
+    return { ok: true, on: Boolean(state.cabIR.on) };
+  };
+
   // Replies an action waits for (delete ack type 51, footswitch assignment ack type 30): writeAndAwait() sends a
   // frame and resolves with the reply's protobuf fields, or null if the write failed or nothing came within 10 s.
   // While a waiter is registered its reply type is consumed here instead of reaching the core's parsers.
@@ -1845,6 +2852,10 @@
     try {
       const v = event && event.target && event.target.value;
       const d = v && v.buffer ? new Uint8Array(v.buffer, v.byteOffset || 0, v.byteLength || v.buffer.byteLength) : null;
+      if (d && presetMoveProtocolPending && frameType(d) === MSG.PresetDirtyStateChanged) {
+        log('Ignoring transient preset-dirty notification during preset reorder.');
+        return;
+      }
       if (d && d.length >= 6 && (d[1] & 0xC0) === 0xC0 && replyWaiters.size) {
         const type = d[d.length - 4] | (d[d.length - 3] << 8) | (d[d.length - 2] << 16) | (d[d.length - 1] << 24);
         const waiter = replyWaiters.get(type);
@@ -1869,7 +2880,10 @@
     const c = state.c304;
     if (!c || c.__tapped) return;
     const real = (c.writeValueWithResponse || c.writeValue).bind(c);
-    state.c304 = { __tapped: true, writeValueWithResponse: (p) => { recordEvent('tx', p, ui.lastTxLabel); return real(p); } };
+    state.c304 = { __tapped: true, writeValueWithResponse: (p) => {
+      recordEvent('tx', p, ui.lastTxLabel);
+      return Promise.resolve().then(() => real(p)).catch((err) => { writeFailed(err); throw err; });
+    } };
   }
   // RX: wrap the core's notification handler (connectNano looks it up by name on connect).
   const coreOnC305 = window.onC305;
@@ -1916,7 +2930,8 @@
       ui.lastTxLabel = label;
     }
     if (rec.on) rec.lines.push({ t: Date.now() - rec.started, text });
-    if (/^Connect failed:/.test(text)) { ui.connectError = friendlyConnectError(text.replace(/^Connect failed:\s*/, '')); ui.connectHelp = /show(ed)? up|Bluetooth is off/.test(ui.connectError); }
+    bleTrack(text);
+    if (/^Connect failed:/.test(text) && !ble.restart) { ui.connectError = friendlyConnectError(text.replace(/^Connect failed:\s*/, '')); ui.connectHelp = /show(ed)? up|Bluetooth is off/.test(ui.connectError); }
     if (ui.drawerOpen) renderLog();
     renderStatusSoon();
     console.log(text);
@@ -1924,8 +2939,52 @@
 
   window.setStatus = function (text, connected = false) {
     ui.connText = text;
-    if (connected) tapC304();
-    if (!connected && /disconnect/i.test(text)) { state.presetDirty = false; beginExpressionBoundary(); ui.lastAction = ''; state.presetTempo = null; }
+    if (connected) {
+      tapC304();
+      if (!ui.demo) bleResult('ok');   // C304/C305 found: the shell remembers this device
+      ui.cabIRLoadPaused = false;
+      ui.cabIRLoadTimedOut = null;
+      const d = window.__dev;
+      if (d && !d.settingsRequestedForConnection) {
+        // Read the global mute state as soon as the pedal is available so the
+        // header control is usable without first opening Settings → Device.
+        d.settingsRequestedForConnection = true;
+        requestDeviceSettings();
+      }
+    }
+    if (!connected && /disconnect/i.test(text)) {
+      releaseLink();
+      ui.cabIRLoadPaused = false;
+      ui.cabIRLoadTimedOut = null;
+      ui.cabIRLoadQueue.length = 0;
+      ui.cabIRLoadActive = null;
+      ui.slotPreselect = 0;
+      ui.captureSlotPreselect = 0;
+      state.pendingCabAssignment = null;
+      state.presetDirty = false; beginExpressionBoundary();
+      NanoLive.reset();
+      ui.presetUnknown = false;
+      const d = window.__dev;
+      if (d) {
+        d.info = null; d.alive = null; d.settings = null; d.reading = false;
+        d.settingsRequestedForConnection = false;
+        d.monitorPending = {}; d.monitorAcks.length = 0;
+        clearTimeout(d.monitorReadTimer); d.monitorReadTimer = null;
+      }
+      const capturePreviewWasActive = ui.previewing || ui.previewBusy;
+      const irPreviewWasActive = Boolean(irAudition.active) || irAudition.busy;
+      stopPreviewKeepAlive();
+      ui.previewing = false;
+      ui.previewBusy = false;
+      ui.previewName = '';
+      irAudition.active = null;
+      irAudition.pending = null;
+      irAudition.busy = false;
+      irAudition.stopping = false;
+      if (capturePreviewWasActive) notifyPreviewState(false, '', 'The Nano Cortex disconnected; live preview stopped.');
+      if (irPreviewWasActive) log('IR preview ended because the Nano Cortex disconnected.');
+      ui.lastAction = ''; state.presetTempo = null;
+    }
     if (!connected) { state.exp.loaded = false; state.exp.preset = null; }
     render();
   };
@@ -1957,7 +3016,7 @@
     } else if (kind === 'error') {
       toast(detail || text);
     } else if (/saving/i.test(text)) {
-      ui.expressionBaselineBoundary = true;
+      ui.clearOverridesOnRead = true;
       ui.lastAction = 'Saving preset ' + state.selectedPreset + '…';
     }
     render();
@@ -1990,19 +3049,28 @@
     return coreCabRefresh.call(this, data);
   };
   window.setCabIRMicPosition = async function (mic, position) {
-    if (!isFactoryCabIR()) { log('Cab mic/position ignored: current IR is not a factory cab slot.'); return; }
-    const cabName = String(state.currentIR.shortName || '').trim();
+    if (irAuditioning()) {
+      log('Cab mic/position ignored: stop the IR preview first.');
+      return false;
+    }
+    if (!selectedIRIsFactory()) { log('Cab mic/position ignored: current IR is not a factory cab slot.'); return false; }
+    const selectedSlot = activeIRSlot();
+    const cabName = String((selectedSlot && state.irNames.get(selectedSlot)) || state.currentIR.shortName || '').trim();
     const micName = String(mic || state.cabIR.mic || '').trim();
-    let index = state.cabIR.libraryIndex;
-    if (!Number.isInteger(index)) { const hit = state.library.irFactory.find(x => sameName(x.name, cabName)); index = hit ? hit.index : null; }
-    if (!cabName || !micName || !Number.isInteger(index)) { log('Cab mic/position ignored: the cab\'s library index is unknown (read the cab first).'); return; }
+    const factoryIR = (state.library.irFactory || []).find(x => sameName(x.name, cabName));
+    let index = factoryIR ? factoryIR.index : state.cabIR.libraryIndex;
+    if (!Number.isInteger(index)) index = null;
+    if (!cabName || !micName || !Number.isInteger(index)) { log('Cab mic/position ignored: the cab\'s library index is unknown (read the cab first).'); return false; }
     const pos = clamp(Math.round(Number(position || state.cabIR.position || 1)), 1, 6);
     state.cabIR.mic = micName;
     state.cabIR.position = pos;
     const cab = new TextEncoder().encode(cabName), m = new TextEncoder().encode(micName);
     const inner = [0x08, ...encodeVarint(index), 0x12, cab.length, ...cab, 0x18, pos - 1, 0x22, m.length, ...m];
-    await writeC304('Cab mic/position ' + micName + ' pos ' + pos, new Uint8Array([inner.length + 6, 0xC0, 0x1A, inner.length, ...inner, 0x5E, 0, 0, 0]));
+    const writePromise = writeC304('Cab mic/position ' + micName + ' pos ' + pos, new Uint8Array([inner.length + 6, 0xC0, 0x1A, inner.length, ...inner, 0x5E, 0, 0, 0]));
+    cabMicPositionWritePromise = writePromise;
+    const written = await writePromise;
     render();
+    return written;
   };
 
   // Gate reduction read-back (verified on the pedal 2026-10-08): the state dump's
@@ -2027,7 +3095,7 @@
     const target = expressionRangeFor(key);
     if (!target) return;
     if (target.block) {
-      const param = expressionAmountParam(state.blocks[target.block]);
+      const param = NanoLive.expressionAmountParam(state.blocks[target.block]);
       if (param && kind === 'param' && value && value.index === param.index) {
         ui.expressionLocalOverrides.set('range:' + key, { kind, key, value: param.value });
       }
@@ -2040,7 +3108,7 @@
     for (const entry of ui.expressionLocalOverrides.values()) {
       if (entry.kind === 'bypass') {
         const targetDef = EXP_BYPASS.find(target => target.key === entry.key);
-        const target = targetDef && expressionTargetState(targetDef);
+        const target = targetDef && NanoLive.expressionTargetState(targetDef);
         if (target && target.get() !== entry.value) { target.set(entry.value); changed = true; }
       } else if (entry.key === 'level') {
         if (state.captureVolumeDb !== entry.value) { state.captureVolumeDb = entry.value; changed = true; }
@@ -2049,58 +3117,15 @@
       } else if (entry.key === 'gate' && state.gate.params[0] && state.gate.params[0].value !== entry.value) {
         state.gate.params[0].value = entry.value; changed = true;
       } else if (state.blocks[entry.key]) {
-        const param = expressionAmountParam(state.blocks[entry.key]);
+        const param = NanoLive.expressionAmountParam(state.blocks[entry.key]);
         if (param && param.value !== entry.value) { param.value = entry.value; changed = true; }
       }
     }
     return changed;
   }
-  const coreApplyExpressionPosition = window.applyExpressionPositionToUI;
-  window.applyExpressionPositionToUI = function (rawPosition) {
-    const result = coreApplyExpressionPosition.apply(this, arguments);
-    if (restoreExpressionLocalOverrides()) render();
-    return result;
-  };
-  function expressionBaselineFromDump(fields) {
-    const value = (n, fallback = 0) => fields[n] && fields[n][0] && fields[n][0].wire === 0 ? fields[n][0].value : fallback;
-    const fixed = (n) => fixed32Float(fields[n] && fields[n][0]);
-    const fx = fields[31] && fields[31][0];
-    const blocks = Object.fromEntries(FX_BLOCK_KEYS.map((key, index) => {
-      const block = state.blocks[key];
-      const param = expressionAmountParam(block);
-      const raw = block && block.originalPreset === state.selectedPreset && block.originalModel === block.model &&
-        param && block.originalFloats && Number.isFinite(block.originalFloats[param.index]) ? block.originalFloats[param.index] : null;
-      return [key, { on: fx && fx.wire === 2 && fx.raw && fx.raw.length > index ? fx.raw[index] === 0 : Boolean(block && block.on), amount: raw === null ? null : normalizedToParamValue(param, raw) }];
-    }));
-    return {
-      preset: Number(state.selectedPreset),
-      amp: { gain: value(3), bass: value(5), mid: value(6), treble: value(7) },
-      capture: { on: value(11) > 0, volumeDb: captureDbFromRaw(value(44)) },
-      cab: { on: Boolean(fields[12] && fields[12][0]) },
-      gate: { on: !(fields[54] && fields[54][0]), reduction: fixed(53) === null ? Number(state.gate.params[0].value) : clamp(Math.round(fixed(53) * 255) - 108, 0, 100) },
-      blocks,
-    };
-  }
-  function updateFXExpressionBaseline(blockKey) {
-    const baseline = ui.expressionBaseline;
-    const block = state.blocks[blockKey];
-    if (!baseline || baseline.preset !== Number(state.selectedPreset) || !block) return;
-    const param = expressionAmountParam(block);
-    const raw = block.originalPreset === state.selectedPreset && block.originalModel === block.model && param &&
-      block.originalFloats && Number.isFinite(block.originalFloats[param.index]) ? block.originalFloats[param.index] : null;
-    if (raw !== null) baseline.blocks[blockKey].amount = normalizedToParamValue(param, raw);
-  }
-  const coreFXParamResponse = window.handleFXParamRefreshResponse;
-  window.handleFXParamRefreshResponse = function (data) {
-    const blockKey = state.pendingParamBlock;
-    const result = coreFXParamResponse.apply(this, arguments);
-    if (blockKey) updateFXExpressionBaseline(blockKey);
-    return result;
-  };
   const coreApplyFXEnabledStates = window.applyFXEnabledStatesFromCurrentState;
   window.applyFXEnabledStatesFromCurrentState = function (fields) {
     const result = coreApplyFXEnabledStates.apply(this, arguments);
-    if (state.expressionPedalRaw !== null) window.applyExpressionPositionToUI(state.expressionPedalRaw);
     if (applyPendingBypassTargets()) render();
     return result;
   };
@@ -2108,13 +3133,10 @@
   window.parseBufferedCurrentState = function () {
     const bytes = state.stateBytes.slice();
     let src = null;
-    let fields = null;
-    const oldPreset = Number(state.selectedPreset);
-    const boundary = ui.expressionBaselineBoundary || !ui.expressionBaseline || expressionBoundaryPreset !== oldPreset || state.protocol.presetLoad;
+    const presetLoadBoundary = state.protocol.presetLoad;
     try {
       if (bytes.length) {
-        fields = parseProtoFields(bytes);
-        const f = fields;
+        const f = parseProtoFields(bytes);
         const v = (n) => (f[n] && f[n][0] && f[n][0].wire === 0 ? f[n][0].value : 0);
         src = { bank: Math.min(5, Math.max(1, v(9) || 1)), pos: v(11), cab: v(12) };
         state.capture.fromLibrary = src.pos > 5;
@@ -2138,6 +3160,25 @@
       state.cabIR.selectedSlot = null;
       log('Cab comes straight from the library: ' + (state.currentIR.shortName || 'unknown') + ' (slot ' + src.cab + ')');
     }
+    const pendingIRTarget = ui.pendingIRSlotTarget;
+    if (pendingIRTarget) {
+      if (presetLoadBoundary || Number(state.selectedPreset) !== pendingIRTarget.preset) clearPendingIRSlotTarget(pendingIRTarget);
+      else {
+        // A read queued by an earlier click can report the previous slot. Keep
+        // the newest selection optimistic until the final read-back settles.
+        state.cabIR.fromLibrary = false;
+        state.cabIR.on = pendingIRTarget.slot > 0;
+        state.cabIR.selectedSlot = pendingIRTarget.slot;
+        state.cabIR.stateSlot = pendingIRTarget.slot;
+        if (pendingIRTarget.slot > 0) state.cabIR.lastActiveSlot = pendingIRTarget.slot;
+        if (pendingIRTarget.currentIR) state.currentIR = { ...pendingIRTarget.currentIR };
+      }
+    } else if (src && src.cab >= 1 && src.cab <= 5) {
+      // Field 12 is the exact slot; matching by IR name can select another slot
+      // when the same IR is stored more than once.
+      state.cabIR.selectedSlot = src.cab;
+      state.cabIR.lastActiveSlot = src.cab;
+    }
     try {
       const all = parseProtoFields(bytes);
       const fw = all[24] && all[24][0] && all[24][0].wire === 2 ? new TextDecoder().decode(Uint8Array.from(all[24][0].raw)).trim() : '';
@@ -2152,13 +3193,12 @@
     } catch { /* leave the gate knob as it was */ }
     try { tempoFromDump(parseProtoFields(bytes)); } catch { /* keep the tempo shown */ }
     followExp();   // a new preset (app, footswitch) or a fresh connection: read its expression assignments
-    if (fields && boundary) {
-      ui.expressionBaseline = expressionBaselineFromDump(fields);
-      ui.expressionBaselineBoundary = false;
-      expressionBoundaryPreset = Number(state.selectedPreset);
+    // After a preset load or a save the dump is the new reference: local edits of expression targets are in it.
+    if (bytes.length && (presetLoadBoundary || ui.clearOverridesOnRead)) {
+      ui.clearOverridesOnRead = false;
       ui.expressionLocalOverrides.clear();
     }
-    if (state.expressionPedalRaw !== null) window.applyExpressionPositionToUI(state.expressionPedalRaw);
+    NanoLive.reapplyExpression();   // the dump has the stored values; the pedal's position is on top of them
     if (applyPendingBypassTargets()) render();
     return r;
   };
@@ -2253,12 +3293,47 @@
   // Picking a slot (or bypassing) moves the preset off a library reference.
   for (const [fn, part] of [['setCapture', 'capture'], ['selectCaptureSlot', 'capture'], ['selectCabIRSlot', 'cabIR']]) {
     const core = window[fn];
-    window[fn] = function () { state[part].fromLibrary = false; return core.apply(this, arguments); };
+    window[fn] = function () {
+      state[part].fromLibrary = false;
+      if (fn !== 'selectCabIRSlot') return core.apply(this, arguments);
+      const slot = Number(arguments[0]);
+      if (!Number.isInteger(slot) || slot < 0 || slot > 5) return core.apply(this, arguments);
+      clearPendingIRSlotTarget();
+      const target = {
+        slot,
+        preset: Number(state.selectedPreset),
+        currentIR: { ...state.currentIR },
+        holdForPreviewStop: Boolean(irAudition.active || irAudition.busy || irAudition.pending),
+      };
+      ui.pendingIRSlotTarget = target;
+      // Current-state replies are untagged; an older read can arrive after a newer click.
+      if (target.holdForPreviewStop) holdIRSlotTargetForPreview();
+      else target.timer = setTimeout(() => settlePendingIRSlotTarget(target), 2500);
+      return core.apply(this, arguments);
+    };
   }
 
   // Core asks which slot a library item should go into; resolves with the slot or null.
+  function noteCabIRLoadSlot(slot) {
+    const job = ui.cabIRLoadActive;
+    if (!job || !slot) return;
+    job.slot = slot;
+    job.phase = 'sending';
+    render();
+  }
+
   window.chooseSlot = function (kind, itemName) {
-    if (ui.slotPreselect) { const s = ui.slotPreselect; ui.slotPreselect = 0; return Promise.resolve(s); }   // "Put a library … in slot N…"
+    if (kind === 'capture' && ui.captureSlotPreselect) {
+      const s = ui.captureSlotPreselect;
+      ui.captureSlotPreselect = 0;
+      return Promise.resolve(s);
+    }
+    if (ui.slotPreselect) {
+      const s = ui.slotPreselect;
+      ui.slotPreselect = 0;
+      if (kind === 'cab') noteCabIRLoadSlot(s);
+      return Promise.resolve(s);
+    }   // "Put a library … in slot N…"
     const isCap = kind === 'capture';
     const count = isCap ? captureSlotCount() : irSlotCount();
     const names = isCap ? state.captureNames : state.irNames;
@@ -2273,10 +3348,60 @@
       title: 'Which slot should hold ' + itemName + '?', wide: true, content: list,
       body: 'Whatever is in that slot on the pedal is replaced' + (ui.usage ? ', for every preset that uses it. Counts show how many presets use each slot (scanned ' + scanTime() + ').' : '.'),
       buttons: [{ id: 'cancel', label: 'Cancel' }, { id: 'ok', label: 'Load into slot', primary: true }],
-    }).then(choice => (choice === 'ok' ? selected : null));
+    }).then(choice => {
+      const slot = choice === 'ok' ? selected : null;
+      if (kind === 'cab' && slot) noteCabIRLoadSlot(slot);
+      return slot;
+    });
   };
 
+  // The core owns the protocol parsing and state updates. Observe its response to
+  // advance the serialized UI queue as soon as the pedal acknowledges the write.
+  const coreCabinetSlotContentResponse = window.handleCabinetSlotContentResponse;
+  if (coreCabinetSlotContentResponse) {
+    window.handleCabinetSlotContentResponse = function (data) {
+      const pending = state.pendingCabAssignment;
+      const active = ui.cabIRLoadActive;
+      const matchesActive = Boolean(pending && active && pending.slot === active.slot && sameName(pending.name, active.name));
+      const timedOut = !pending && ui.cabIRLoadPaused ? ui.cabIRLoadTimedOut : null;
+      let accepted = false;
+      try {
+        const fields = parseProtoFields(Array.from(data.slice(2, data.length - 4)));
+        accepted = Boolean(fields[3] && fields[3][0] && fields[3][0].value === 1);
+      } catch (err) {
+        log('Could not parse the library cab load response: ' + err.message);
+      }
+
+      const result = coreCabinetSlotContentResponse.apply(this, arguments);
+      if (matchesActive) {
+        active.responseReceived = true;
+        if (accepted) {
+          active.phase = 'activating';
+          render();
+        } else {
+          void finishCabIRLoad(active, false, { acknowledged: true });
+        }
+      } else if (timedOut) {
+        ui.cabIRLoadTimedOut = null;
+        ui.cabIRLoadPaused = false;
+        if (accepted) {
+          state.irNames.set(timedOut.slot, timedOut.name);
+          state.currentIR = { shortName: timedOut.name, fullName: timedOut.name, inBank: true, slot: timedOut.slot };
+          selectCabIRSlot(timedOut.slot);
+          if (ui.demo) demo.pickIR(timedOut.slot);
+          toast('Cab ' + timedOut.name + ' loaded into slot ' + timedOut.slot);
+        } else {
+          toast('The pedal rejected the earlier IR change. You can try again.');
+        }
+        render();
+        startNextCabIRLoad();
+      }
+      return result;
+    };
+  }
+
   function render() {
+    syncAuditionState();
     if (ui.knobDragging) {
       ui.renderAfterKnob = true;
       return;
@@ -2296,6 +3421,7 @@
   // ------------------------------------------------------------------ rendering
   function renderAll() {
     const fk = document.activeElement && document.activeElement.dataset ? document.activeElement.dataset.fk : null;
+    notifyCabIRState();
     renderHead();
     renderSide();
     renderFootswitches();
@@ -2315,11 +3441,12 @@
 
   function renderHead() {
     const t = $('presetTitle');
+    const unknown = state.connected && ui.presetUnknown;
     t.replaceChildren(
-      el('span', { class: 'num', text: state.connected ? 'Preset ' + state.selectedPreset : '' }),
-      el('span', { class: 'name', text: state.connected ? presetName(state.selectedPreset) : '' })
+      el('span', { class: 'num', text: !state.connected ? '' : unknown ? 'Preset ?' : 'Preset ' + state.selectedPreset }),
+      el('span', { class: 'name', text: !state.connected ? '' : unknown ? 'Not known yet' : presetName(state.selectedPreset) })
     );
-    const dirty = pedalDirtyForUI() && state.connected;
+    const dirty = pedalDirtyForUI() && state.connected && !unknown;
     $('dirtyMark').hidden = !dirty;
 
     const busy = ui.connecting || /requesting|connecting/i.test(ui.connText);
@@ -2329,25 +3456,260 @@
     cb.disabled = busy && !state.connected;
     cb.className = 'btn' + (!state.connected && !busy ? ' primary' : '');
 
-    $('saveBtn').disabled = !state.connected;
-    $('saveAsBtn').disabled = !state.connected;
+    $('saveBtn').disabled = !state.connected || unknown;
+    $('saveAsBtn').disabled = !state.connected || unknown;
     $('saveBtn').className = 'btn' + (dirty ? ' primary' : '');
     $('discardBtn').hidden = !dirty;
     $('refreshBtn').disabled = !state.connected || ui.demo;
-    $('renameBtn').disabled = !state.connected;
+    $('renameBtn').disabled = !state.connected || unknown;
     $('tunerBtn').disabled = !state.connected;
     $('tunerBtn').classList.toggle('on', state.tuner.open);
+    renderMuteButton();
+  }
+
+  function renderMuteButton() {
+    const button = $('muteBtn');
+    if (!button) return;
+    const settings = state.connected && window.__dev && window.__dev.settings;
+    const muted = Boolean(settings && settings.muteInput);
+    button.disabled = !settings;
+    button.classList.toggle('mute-active', muted);
+    button.setAttribute('aria-pressed', String(muted));
+  }
+
+  // ------------------------------------------------------------------ preset reordering (from #14)
+  // Drag a preset row onto another: 143 { 1: 4, 3: from, 4: to } (0-based; an insertion, the presets in between
+  // shift by one), acked by 144 { 1: 6, 3: from, 4: to, 5: 1 }. Then the list and the current state are read back
+  // from the pedal like at connect; nothing about the new order or the current preset is assumed. INVESTIGATION §12.
+  const MSG_PRESET_MOVE = 143, MSG_PRESET_MOVE_REPLY = 144;
+  const REORDER_TIMEOUTS = { list: 20000, state: 6000 };
+  window.__reorderTimeouts = REORDER_TIMEOUTS;              // the UX test shortens them
+  const canReorder = () => state.connected && !ui.presetReorderBusy && !ui.scanning;
+  const presetMoveFrame = (from, to) => buildFrame([0x08, 0x04, 0x18, ...encodeVarint(from), 0x20, ...encodeVarint(to)], MSG_PRESET_MOVE);
+
+  // Edits are dropped when the pedal moves presets around (the phone app asks first, too).
+  async function askBeforePresetReorder() {
+    if (!isDirtyNow()) return true;
+    const current = state.selectedPreset;
+    const choice = await modal({
+      title: 'Save changes to ' + presetName(current) + '?',
+      body: 'Reordering presets can discard edits that haven’t been saved to the pedal.',
+      buttons: [
+        { id: 'cancel', label: 'Cancel' },
+        { id: 'discard', label: 'Don’t save' },
+        { id: 'save', label: 'Save and reorder', primary: true },
+      ],
+    });
+    if (choice === 'save') {
+      await doSave();
+      if (pedalDirtyForUI()) { toast('Save the current preset before reordering.'); return false; }
+      return true;
+    }
+    if (choice !== 'discard') return false;
+    const before = NanoLive.stateReads;
+    state.exp.loaded = false;
+    await selectPreset(current);
+    if (ui.demo) demo.load(current);
+    if (!(await waitUntil(() => !state.protocol.presetLoad && NanoLive.stateReads > before, 7000))) {
+      toast('The pedal did not confirm reloading the saved preset.');
+      return false;
+    }
+    return true;
+  }
+
+  // The preset list and the state again, the way a connect reads them (upstream's metadata read, then the state).
+  async function rereadPresetsAfterMove() {
+    const before = NanoLive.stateReads;
+    state.protocol.metadataLoaded = false;
+    await syncMetadataAndState();
+    const listed = await waitUntil(() => !state.connected || state.protocol.metadataLoaded, REORDER_TIMEOUTS.list) && state.connected && state.protocol.metadataLoaded;
+    const read = await waitUntil(() => !state.connected || (NanoLive.stateReads > before && !state.protocol.presetLoad), REORDER_TIMEOUTS.state + 1000) &&
+      state.connected && NanoLive.stateReads > before;
+    if (!read && state.stateMode === 'current' && !state.stateBytes.length) state.stateMode = 'idle';
+    return { listed: !!listed, read: !!read };
+  }
+
+  // Without a state read after a move the editor doesn't know which preset the pedal is on (a move can shift it), so
+  // Save, Save as, Discard and Rename stay off until a read succeeds (Refresh, a preset switch, reconnecting).
+  const PRESET_UNKNOWN = 'The editor doesn’t know which preset the pedal is on. Refresh (or pick a preset) to read it again.';
+  function presetUnknownRefuses() {
+    if (!ui.presetUnknown) return false;
+    toast(PRESET_UNKNOWN);
+    return true;
+  }
+
+  async function movePresetOrder(source, destination) {
+    if (source === destination || ui.presetReorderBusy || !state.connected) return false;
+    if (ui.scanning) { toast('Wait for the slot usage scan to finish before reordering.'); return false; }
+    if (state.stateMode !== 'idle' || state.protocol.presetLoad || state.presetLoadTimer || state.pendingParamBlock || state.paramRefreshQueue.length || state.fileBusy || state.saveBusy ||
+        gattWriteQueue.length || gattWritePumpRunning || ui.uploading || NanoTransfer.busy) {
+      toast('Wait for the current pedal operation to finish before reordering.');
+      return false;
+    }
+    ui.presetReorderBusy = true;
+    ui.sideSig = '';
+    render();
+    try {
+      if (!(await stopAnyAudition('the reorder'))) return false;
+      if (!(await askBeforePresetReorder()) || !state.connected) return false;
+      presetMoveProtocolPending = true;   // the pedal reports 115 dirty, then clean, around a move: not an edit
+      const reply = await writeAndAwait('Move preset ' + (source + 1) + ' to position ' + (destination + 1), presetMoveFrame(source, destination), MSG_PRESET_MOVE_REPLY);
+      const ackOk = Boolean(reply) && fieldValue(reply, 5) === 1 && fieldValue(reply, 3) === source && fieldValue(reply, 4) === destination;
+      log('Preset reorder ' + (ackOk ? 'acknowledged' : 'NOT confirmed') + ': type 144 ' + (reply ? 'source=' + fieldValue(reply, 3) + ' destination=' + fieldValue(reply, 4) + ' status=' + fieldValue(reply, 5) : 'no reply'));
+      // Read back whatever happened, confirmed or not: the pedal's order and its current preset are the truth.
+      const { listed, read } = await rereadPresetsAfterMove();
+      log('Preset reorder read-back: list=' + listed + ', state=' + read);
+      if (!read) { ui.presetUnknown = true; render(); }
+      if (!ackOk) {
+        toast('The pedal did not confirm the move. ' + (listed ? 'The list shows its order as it is now.' : 'Its order could not be read either: Refresh to see it.') + (read ? '' : ' ' + PRESET_UNKNOWN));
+        return false;
+      }
+      if (!listed || !read) {
+        toast('Preset moved, but ' + (!listed ? 'the preset list could not be read again (Refresh to see the order)' : 'the current preset could not be read again') + '. ' + (read ? '' : PRESET_UNKNOWN));
+        return false;
+      }
+      toast('Moved preset ' + (source + 1) + ' to position ' + (destination + 1) + '.');
+      return true;
+    } catch (err) {
+      log('ERROR: preset reorder: ' + err.message);
+      toast('Preset reorder failed: ' + err.message);
+      return false;
+    } finally {
+      presetMoveProtocolPending = false;
+      ui.presetReorderBusy = false;
+      ui.sideSig = '';
+      render();
+    }
+  }
+  window.__movePresetOrder = movePresetOrder;
+
+  // Dragging a row uses pointer events, not HTML5 drag and drop: during a system drag session the OS owns the cursor
+  // (the arrow on macOS), and the closed hand has to show for the whole drag. Press anywhere on a row (the ⋮⋮ grip at
+  // its right end is the affordance, not the only handle), move 4 px, drop it on another row; Escape cancels. Near the
+  // list's top or bottom edge, or with the wheel, the list scrolls. Only a press on a row of this list starts one, so
+  // nothing dropped from elsewhere can move a preset.
+  const PRESET_DRAG_THRESHOLD = 4;
+  const GRIP_SVG = '<svg viewBox="0 0 6 10" width="6" height="10" fill="currentColor" aria-hidden="true"><circle cx="1" cy="1" r="1"/><circle cx="5" cy="1" r="1"/><circle cx="1" cy="5" r="1"/><circle cx="5" cy="5" r="1"/><circle cx="1" cy="9" r="1"/><circle cx="5" cy="9" r="1"/></svg>';
+  let presetDrag = null;   // { from, pointerId, x0, y0, x, y, active, target, ghost, dx, dy, raf }
+  window.__presetDrag = () => presetDrag && { from: presetDrag.from, active: presetDrag.active, target: presetDrag.target };
+  function presetRowAt(x, y) {
+    const hit = document.elementFromPoint(x, y);
+    const row = hit && hit.closest ? hit.closest('.preset-row') : null;
+    return row && $('presetList').contains(row) ? Number(row.dataset.n) : 0;
+  }
+  function markPresetDrag() {
+    const d = presetDrag && presetDrag.active ? presetDrag : null;
+    for (const r of $('presetList').querySelectorAll('.preset-row')) {
+      const n = Number(r.dataset.n);
+      r.classList.toggle('dragging', !!d && n === d.from);
+      r.classList.toggle('drop-target', !!d && n === d.target && n !== d.from);
+    }
+  }
+  function onPresetPointerDown(e) {
+    if (e.button !== 0 || e.ctrlKey) return;   // Control-click is the context menu on a Mac
+    const row = e.target && e.target.closest ? e.target.closest('.preset-row') : null;
+    if (!row || !$('presetList').contains(row) || !canReorder()) return;
+    endPresetDrag();
+    presetDrag = { from: Number(row.dataset.n), pointerId: e.pointerId, x0: e.clientX, y0: e.clientY, x: e.clientX, y: e.clientY, active: false, target: 0, ghost: null, dx: 0, dy: 0, raf: 0 };
+    document.addEventListener('pointermove', onPresetPointerMove, true);
+    document.addEventListener('pointerup', onPresetPointerUp, true);
+    document.addEventListener('pointercancel', onPresetPointerCancel, true);
+    document.addEventListener('keydown', onPresetDragKey, true);
+    $('presetList').addEventListener('scroll', onPresetDragScroll);
+    window.addEventListener('blur', onPresetPointerCancel);
+  }
+  function beginPresetDrag(d) {
+    d.active = true;
+    document.documentElement.classList.add('preset-dragging');
+    // A copy of the row follows the pointer, held where it was grabbed (what the system drag image did).
+    const row = $('presetList').querySelector('.preset-row[data-n="' + d.from + '"]');
+    if (row) {
+      const r = row.getBoundingClientRect();
+      d.dx = d.x0 - r.left; d.dy = d.y0 - r.top;
+      const copy = row.cloneNode(true);
+      copy.removeAttribute('data-n'); copy.removeAttribute('role'); copy.removeAttribute('aria-selected');
+      copy.classList.remove('dragging', 'drop-target');
+      d.ghost = el('div', { class: 'preset-ghost', 'aria-hidden': 'true', style: 'width:' + r.width + 'px' }, copy);
+      document.body.append(d.ghost);
+    }
+  }
+  function onPresetPointerMove(e) {
+    const d = presetDrag;
+    if (!d || e.pointerId !== d.pointerId) return;
+    d.x = e.clientX; d.y = e.clientY;
+    if (!d.active) {
+      if (Math.hypot(d.x - d.x0, d.y - d.y0) < PRESET_DRAG_THRESHOLD) return;
+      if (!canReorder()) { endPresetDrag(); return; }
+      beginPresetDrag(d);
+    }
+    e.preventDefault();
+    if (d.ghost) { d.ghost.style.left = (d.x - d.dx) + 'px'; d.ghost.style.top = (d.y - d.dy) + 'px'; }
+    d.target = presetRowAt(d.x, d.y);
+    markPresetDrag();
+    if (!d.raf) d.raf = requestAnimationFrame(presetAutoScroll);
+  }
+  function presetAutoScroll() {
+    const d = presetDrag;
+    if (!d || !d.active) return;
+    d.raf = 0;
+    const list = $('presetList'), r = list.getBoundingClientRect(), EDGE = 28;
+    if (d.x < r.left || d.x > r.right || d.y < r.top - EDGE || d.y > r.bottom + EDGE) return;
+    const v = d.y < r.top + EDGE ? -Math.min(16, Math.ceil((r.top + EDGE - d.y) / 2)) : d.y > r.bottom - EDGE ? Math.min(16, Math.ceil((d.y - r.bottom + EDGE) / 2)) : 0;
+    if (!v) return;
+    const before = list.scrollTop;
+    list.scrollTop += v;
+    if (list.scrollTop !== before) d.raf = requestAnimationFrame(presetAutoScroll);   // the scroll event updates the target
+  }
+  function onPresetDragScroll() {
+    const d = presetDrag;
+    if (!d || !d.active) return;
+    d.target = presetRowAt(d.x, d.y);
+    markPresetDrag();
+  }
+  function onPresetPointerUp(e) {
+    const d = presetDrag;
+    if (!d || e.pointerId !== d.pointerId) return;
+    const dropped = d.active ? presetRowAt(e.clientX, e.clientY) : 0;
+    const wasDrag = d.active;
+    endPresetDrag();
+    if (!wasDrag) return;   // a plain click: the row's click handler loads the preset
+    e.preventDefault();
+    if (!dropped || dropped === d.from || !canReorder()) return;
+    void movePresetOrder(d.from - 1, dropped - 1);
+  }
+  function onPresetPointerCancel() { endPresetDrag(); }
+  function onPresetDragKey(e) {
+    if (e.key !== 'Escape' || !presetDrag || !presetDrag.active) return;
+    e.preventDefault(); e.stopPropagation();
+    endPresetDrag();
+  }
+  function endPresetDrag() {
+    const d = presetDrag;
+    presetDrag = null;
+    document.removeEventListener('pointermove', onPresetPointerMove, true);
+    document.removeEventListener('pointerup', onPresetPointerUp, true);
+    document.removeEventListener('pointercancel', onPresetPointerCancel, true);
+    document.removeEventListener('keydown', onPresetDragKey, true);
+    $('presetList').removeEventListener('scroll', onPresetDragScroll);
+    window.removeEventListener('blur', onPresetPointerCancel);
+    if (!d) return;
+    if (d.raf) cancelAnimationFrame(d.raf);
+    if (d.ghost) d.ghost.remove();
+    document.documentElement.classList.remove('preset-dragging');
+    if (d.active) suppressPresetClickUntil = Date.now() + 350;   // the click that follows the release loads nothing
+    markPresetDrag();
   }
 
   function renderSide() {
     const q = ui.filter.trim().toLowerCase();
     const names = [];
     for (let i = 1; i <= 64; i++) names.push(presetName(i));
-    const sig = [state.connected, state.selectedPreset, q, names.join('|')].join('#');
+    const sig = [state.connected, state.selectedPreset, ui.presetUnknown, q, canReorder(), names.join('|')].join('#');
     if (sig === ui.sideSig) return;
     ui.sideSig = sig;
 
     const list = $('presetList');
+    list.setAttribute('aria-busy', String(ui.presetReorderBusy));
     $('presetFilter').disabled = !state.connected;
     if (!state.connected) {
       list.replaceChildren(el('div', { class: 'side-empty', text: 'Your presets appear here once the pedal is connected.' }));
@@ -2358,7 +3720,11 @@
       const name = presetName(i);
       if (q && !name.toLowerCase().includes(q) && String(i) !== q) continue;
       const empty = /^empty$/i.test(name);
+      const grip = el('span', { class: 'grip', title: 'Drag to move this preset', 'aria-hidden': 'true' });
+      grip.innerHTML = GRIP_SVG;
       rows.push(el('div', {
+        // Drag a row (anywhere on it) onto another to move it there: onPresetPointerDown above. `reorderable` shows
+        // the ⋮⋮ grip on the row under the mouse; rows aren't reorderable while a move or the slot scan runs.
         oncontextmenu: (e) => contextMenu(e, [
           { label: i === state.selectedPreset ? 'Current preset' : 'Load', disabled: !state.connected || i === state.selectedPreset, action: () => goToPreset(i) },
           ...(i === state.selectedPreset ? [{ label: 'Discard edits', disabled: !state.connected || !isDirtyNow(), action: () => doDiscard() }] : []),
@@ -2370,15 +3736,16 @@
           '-',
           { label: 'Delete\u2026', danger: true, disabled: !state.connected || empty, action: () => doDelete(i) },
         ]),
-        class: 'preset-row' + (state.connected && i === state.selectedPreset ? ' active' : '') + (empty ? ' empty' : ''),
+        class: 'preset-row' + (state.connected && !ui.presetUnknown && i === state.selectedPreset ? ' active' : '') + (empty ? ' empty' : '') + (ui.presetReorderBusy ? ' reorder-pending' : '') + (canReorder() ? ' reorderable' : ''),
         role: 'option',
-        'aria-selected': String(state.connected && i === state.selectedPreset),
+        'aria-selected': String(state.connected && !ui.presetUnknown && i === state.selectedPreset),
         dataset: { n: i },
-        onclick: () => goToPreset(i),
-      }, el('span', { class: 'n', text: i }), el('span', { class: 't', text: name })));
+        onclick: () => { if (Date.now() > suppressPresetClickUntil) goToPreset(i); },
+      }, el('span', { class: 'n', text: i }), el('span', { class: 't', text: name }), grip));
     }
     if (!rows.length) rows.push(el('div', { class: 'side-empty', text: 'No presets match “' + ui.filter + '”.' }));
     list.replaceChildren(...rows);
+    if (presetDrag && presetDrag.active) markPresetDrag();   // redrawn mid-drag (a pedal report): keep the styling
   }
 
   // Footswitches strip under the preset list: IA IB / IIA IIB, each with the preset it loads in 4-Preset mode.
@@ -2430,7 +3797,11 @@
       items.push({ label: info.none ? 'Add an effect\u2026' : 'Change effect\u2026', disabled: !state.connected, action: () => { select(s.key); render(); requestAnimationFrame(() => { const b = document.querySelector('[data-fk="picker-' + s.key + '"]'); if (b) openModelPicker(s.key, b); }); } });
       items.push({ label: 'Clear slot', disabled: !state.connected || info.none, action: () => { chooseModel(s.key, 'None'); render(); } });
     } else if (s.key === 'capture' || s.key === 'cab') {
-      items.push({ label: s.key === 'capture' ? 'Pick a capture from the library\u2026' : 'Pick a cab from the library\u2026', disabled: !state.connected, action: () => { select(s.key); render(); requestAnimationFrame(() => { const b = document.querySelector('[data-fk="lib-' + s.key + '"]'); if (b) openLibraryPicker(s.key, b); }); } });
+      // Captures: the library picker. Cabs: the inspector's "From the library" list (its search box).
+      items.push({ label: s.key === 'capture' ? 'Pick a capture from the library\u2026' : 'Pick a cab from the library\u2026', disabled: !state.connected, action: () => { select(s.key); render(); requestAnimationFrame(() => {
+        if (s.key === 'cab') { const q = document.querySelector('[data-fk="cab-lib-search"]'); if (q) { q.scrollIntoView({ block: 'center' }); q.focus(); } return; }
+        const b = document.querySelector('[data-fk="lib-' + s.key + '"]'); if (b) openLibraryPicker(s.key, b);
+      }); } });
       if (s.key === 'capture') { const slot = activeCaptureSlot(); items.push({ label: 'Info\u2026', disabled: !state.connected || !slot, action: () => openCaptureInfo(slot, document.querySelector('[data-fk="node-capture"]')) }); }
     }
     return items;
@@ -2781,26 +4152,35 @@
 
   function inspCab(s) {
     const on = state.cabIR.on;
-    const factory = isFactoryCabIR();
+    const factory = selectedIRIsFactory();
+    const irPreviewing = irAuditioning();
+    const irLoad = ui.cabIRLoadActive;
+    const irLoadBusy = Boolean(irLoad);
+    const micPositionEditable = factory && on && !irPreviewing;
+    const micPositionLockTitle = irPreviewing
+      ? 'Stop the IR preview to change the microphone or position.'
+      : 'Mic and position apply to factory cabs only';
     const out = [head(s, [], bypassSwitch('cab', on))];
 
     const MICS = ['Condenser 184', 'Condenser 414', 'Dynamic 421', 'Dynamic 57', 'Ribbon 160'];
     const micRow = el('div', { class: 'params wide' },
-      el('div', { class: 'choice' + (factory && on ? '' : ' locked'), title: factory ? null : 'Mic and position apply to factory cabs only' },
+      el('div', { class: 'choice' + (micPositionEditable ? '' : ' locked'), title: micPositionEditable ? null : micPositionLockTitle },
         el('span', { class: 'label', text: 'Mic' }),
         el('div', { class: 'seg', role: 'radiogroup', 'aria-label': 'Mic' },
           MICS.map(m => el('button', {
+            disabled: !micPositionEditable,
             class: sameName(state.cabIR.mic, m) ? 'on' : '', role: 'radio', 'aria-checked': String(sameName(state.cabIR.mic, m)),
             dataset: { fk: 'mic-' + m },
-            onclick: () => { if (!sameName(state.cabIR.mic, m)) { setCabIRMicPosition(m, state.cabIR.position); state.cabIR.mic = m; render(); } },
+            onclick: () => { if (micPositionEditable && !irAuditioning() && !sameName(state.cabIR.mic, m)) { void setCabIRMicPosition(m, state.cabIR.position); } },
           }, m)))),
-      el('div', { class: 'choice' + (factory && on ? '' : ' locked') },
+      el('div', { class: 'choice' + (micPositionEditable ? '' : ' locked'), title: micPositionEditable ? null : micPositionLockTitle },
         el('span', { class: 'label', text: 'Position' }),
         el('div', { class: 'seg', role: 'radiogroup', 'aria-label': 'Mic position' },
           [1, 2, 3, 4, 5, 6].map(n => el('button', {
+            disabled: !micPositionEditable,
             class: Number(state.cabIR.position) === n ? 'on' : '', role: 'radio', 'aria-checked': String(Number(state.cabIR.position) === n),
             dataset: { fk: 'pos-' + n },
-            onclick: () => { if (Number(state.cabIR.position) !== n) { setCabIRMicPosition(state.cabIR.mic, n); state.cabIR.position = n; render(); } },
+            onclick: () => { if (micPositionEditable && !irAuditioning() && Number(state.cabIR.position) !== n) { void setCabIRMicPosition(state.cabIR.mic, n); } },
           }, String(n))))));
 
     const knobs = el('div', { class: 'params' },
@@ -2835,15 +4215,24 @@
 
     out.push(el('div', { class: 'section' }, el('h3', { text: 'Tone' }), knobs));
     out.push(el('div', { class: 'section' }, el('h3', { text: 'Microphone' }),
-      factory ? null : el('p', { class: 'note', text: 'Mic and position only apply to the factory cabs.' }), micRow));
+      irPreviewing
+        ? el('p', { class: 'note', text: 'Stop the IR preview to change the microphone or position.' })
+        : factory ? null : el('p', { class: 'note', text: 'Mic and position only apply to the factory cabs.' }),
+      micRow));
 
     const cur = activeIRSlot();
-    const slots = el('div', { class: 'slots' + (on ? '' : ' disabled'), role: 'listbox', 'aria-label': 'IR slots' });
+    const slots = el('div', {
+      class: 'slots' + (on ? '' : ' disabled') + (irLoadBusy ? ' loading' : ''),
+      role: 'listbox', 'aria-label': 'IR slots', 'aria-busy': String(irLoadBusy),
+    });
     for (let i = 1; i <= irSlotCount(); i++) {
       const name = state.irNames.get(i) || ('IR ' + i);
+      const loadingThisSlot = Boolean(irLoad && irLoad.slot === i && irLoad.phase !== 'choosing');
       slots.append(el('button', {
-        class: 'slot' + (i === cur ? ' on' : ''), role: 'option', 'aria-selected': String(i === cur),
-        dataset: { fk: 'irslot-' + i }, disabled: !state.connected,
+        class: 'slot' + (i === cur ? ' on' : '') + (irAudition.active && i === cur ? ' preview-muted' : '') + (loadingThisSlot ? ' ir-loading' : ''),
+        role: 'option', 'aria-selected': String(i === cur), 'aria-busy': String(loadingThisSlot),
+        title: loadingThisSlot ? 'Loading ' + irLoad.name + ' into this IR slot' : null,
+        dataset: { fk: 'irslot-' + i }, disabled: !state.connected || irLoadBusy,
         oncontextmenu: (e) => { const anchor = e.currentTarget; contextMenu(e, [
           { label: i === cur ? 'Loaded in this preset' : 'Load into this preset', disabled: !state.connected || i === cur, action: () => anchor.click() },
           { label: 'Put a library cab in slot ' + i + '\u2026', disabled: !state.connected, action: () => openLibraryPicker('cab', anchor, i) },
@@ -2855,15 +4244,26 @@
           if (ui.demo) demo.pickIR(i);
           render();
         },
-      }, el('span', { class: 'n', text: i }), el('span', { class: 't', text: name }), usageBadge('cab', i)));
+      }, el('span', { class: 'n', text: i }), el('span', { class: 't', text: name }),
+        loadingThisSlot ? el('span', { class: 'slot-load-pending', text: '…', 'aria-label': 'Loading' }) : usageBadge('cab', i)));
     }
     const cabFromLib = on && state.cabIR.fromLibrary;
-    out.push(el('div', { class: 'section' }, el('div', { class: 'section-head' }, el('h3', { text: 'Cabs and IRs on the pedal' }),
-        el('button', { class: 'btn ghost small', dataset: { fk: 'lib-cab' }, disabled: !state.connected,
-          title: 'Pick a cab or IR from the library stored on the pedal and load it into a slot',
-          onclick: (e) => openLibraryPicker('cab', e.currentTarget) }, 'Load from library…')),
+    const loadStatus = irLoad
+      ? (irLoad.phase === 'choosing'
+        ? 'Choose a slot for ' + irLoad.name + '…'
+        : irLoad.phase === 'sending'
+          ? 'Loading ' + irLoad.name + ' into IR slot ' + irLoad.slot + '…'
+          : 'Activating IR slot ' + irLoad.slot + '…')
+      : ui.cabIRLoadPaused ? 'The last IR change was not confirmed. Reconnect before loading another IR.' : '';
+    const irQueueCount = ui.cabIRLoadQueue.length;
+    out.push(el('div', { class: 'section' }, el('div', { class: 'section-head' }, el('h3', { text: 'Cabs and IRs on the pedal' })),
       cabFromLib ? el('p', { class: 'note', dataset: { fk: 'cab-from-lib' }, text: 'From the library: ' + (state.currentIR.shortName || 'a cab') + '. This preset plays it straight from the pedal\u2019s library, not from a slot.' }) : null,
+      loadStatus ? el('p', { class: 'note ir-load-status', role: 'status', 'aria-live': 'polite', text: loadStatus + (irLoad && irQueueCount ? ' ' + irQueueCount + ' more queued.' : '') }) : null,
       !on ? el('p', { class: 'note', text: 'Turn the cab back on to pick a slot.' }) : null, slots));
+    out.push(el('div', { class: 'section cab-library-section' },
+      el('div', { class: 'section-divider' }, el('h3', { text: 'From the library' })),
+      el('p', { class: 'library-hint', text: 'Click a cab or IR to choose a slot. Preview auditions it without changing any slot.' }),
+      irLibrarySection()));
     return out;
   }
 
@@ -3270,13 +4670,30 @@
       class: 'ctx-item' + (it.danger ? ' danger' : ''), role: 'menuitem', disabled: it.disabled ? 'true' : null,
       onclick: () => { closeContextMenu(); it.action(); },
     }, it.label)));
+    menu.style.visibility = 'hidden';
     const bg = el('div', { class: 'ctx-bg', oncontextmenu: (ev) => { ev.preventDefault(); if (ui.stageContextNativePending) { ui.stageContextNativePending = false; return; } closeContextMenu(); }, onmousedown: (ev) => { if (ev.target === bg) closeContextMenu(); } }, menu);
     document.body.append(bg); ctx = bg;
-    const r = menu.getBoundingClientRect();
-    menu.style.left = Math.min(e.clientX, window.innerWidth - r.width - 8) + 'px';
-    menu.style.top = Math.min(e.clientY, window.innerHeight - r.height - 8) + 'px';
-    document.addEventListener('keydown', ctxKey, true);
-    const first = menu.querySelector('button:not(:disabled)'); if (first) first.focus();
+    requestAnimationFrame(() => {
+      if (ctx !== bg) return;
+      const bounds = bg.getBoundingClientRect();
+      const margin = 8;
+      const maxWidth = Math.max(0, bounds.width - margin * 2);
+      const maxHeight = Math.max(0, bounds.height - margin * 2);
+      menu.style.setProperty('--ctx-max-width', maxWidth + 'px');
+      menu.style.setProperty('--ctx-max-height', maxHeight + 'px');
+      const r = menu.getBoundingClientRect();
+      const pointerX = e.clientX - bounds.left;
+      const pointerY = e.clientY - bounds.top;
+      const maxLeft = Math.max(margin, bounds.width - r.width - margin);
+      const maxTop = Math.max(margin, bounds.height - r.height - margin);
+      const left = pointerX + r.width > bounds.width - margin ? pointerX - r.width : pointerX;
+      const top = pointerY + r.height > bounds.height - margin ? pointerY - r.height : pointerY;
+      menu.style.left = Math.min(Math.max(left, margin), maxLeft) + 'px';
+      menu.style.top = Math.min(Math.max(top, margin), maxTop) + 'px';
+      menu.style.visibility = '';
+      document.addEventListener('keydown', ctxKey, true);
+      const first = menu.querySelector('button:not(:disabled)'); if (first) first.focus();
+    });
   }
   window.__contextMenu = contextMenu;
   window.__closePopover = closePopover;
@@ -3387,7 +4804,7 @@
     $('bleLed').className = 'led' + (ble ? ' on' : busy ? ' busy' : '');
     $('bleText').textContent = ui.demo ? 'Demo data, nothing is sent' : ble ? 'Connected to Nano Cortex' + (state.firmware ? ' · firmware ' + state.firmware : '') : busy ? 'Connecting…' : 'No pedal';
     // Only speaks up when the pedal itself reports something worth knowing.
-    const note = ble && pedalDirtyForUI() ? 'Pedal reports unsaved changes' : '';
+    const note = ble && ui.presetUnknown ? 'Current preset unknown: Refresh to read it' : ble && pedalDirtyForUI() ? 'Pedal reports unsaved changes' : '';
     $('pcText').textContent = note;
     $('pcText').parentElement.hidden = !note;
     // "Sent: <protocol label>" is a developer detail; progress like "Saving preset 3…" is for everyone.
@@ -3432,6 +4849,116 @@
     if (shellBridge && shellBridge.setDevTools) shellBridge.setDevTools(devTools).catch(() => {});
   }
   window.__devTools = { get on() { return devTools; }, set: setDevTools };
+
+  // ------------------------------------------------------------------ updates (desktop app)
+  // The shell (src/updates.js) checks GitHub Releases and sends events here; this draws the modal and sends the
+  // answers back. Without the shell (the UX test) __updates.event() drives it and the answers collect in
+  // __updates.actions.
+  //   events: checking | none | error {message} | available {version, notes, url, mode: 'install' | 'notify'}
+  //           | progress {percent} | downloaded {version}
+  const upd = { box: null, stage: '', version: '', actions: [] };
+  function updAnswer(what) {
+    upd.actions.push(what);
+    if (shellBridge && shellBridge.updateAction) shellBridge.updateAction(what, upd.version).catch(() => {});
+  }
+  function closeUpdate() {
+    const b = upd.box;
+    if (!b) return;
+    upd.box = null; upd.stage = '';
+    b.bg.remove();
+    document.removeEventListener('keydown', b.onKey, true);
+  }
+  // Esc and a click outside mean "not now": Remind me later, or Later once downloaded. Nothing while downloading.
+  function updDismiss() {
+    if (upd.stage === 'available') { updAnswer('later'); closeUpdate(); }
+    else if (upd.stage === 'downloaded') { updAnswer('later'); closeUpdate(); toast('The update installs when you quit.'); }
+  }
+  function updateModal() {
+    if (upd.box) return upd.box;
+    const title = el('h2', { dataset: { fk: 'upd-title' } });
+    const notes = el('p', { class: 'upd-notes', dataset: { fk: 'upd-notes' } });
+    const more = el('p', { class: 'upd-more' });
+    const bar = el('div', { class: 'upd-bar' }, el('span'));
+    const pct = el('span', { class: 'upd-pct', dataset: { fk: 'upd-pct' } });
+    const progress = el('div', { class: 'upd-progress', dataset: { fk: 'upd-progress' }, hidden: true }, bar, pct);
+    const row = el('div', { class: 'row' });
+    const dialog = el('div', { class: 'modal upd-modal', role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'updTitle', dataset: { fk: 'upd-modal' } }, title, notes, more, progress, row);
+    title.id = 'updTitle';
+    const bg = el('div', { class: 'modal-bg', onclick: (e) => { if (e.target === bg) updDismiss(); } }, dialog);
+    const onKey = (e) => {
+      if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); updDismiss(); return; }
+      if (e.key === 'Tab') {
+        const f = [...bg.querySelectorAll('button:not(:disabled), a[href]')];
+        const i = f.indexOf(document.activeElement);
+        e.preventDefault();
+        if (f.length) f[(i + (e.shiftKey ? -1 : 1) + f.length) % f.length].focus();
+      }
+      e.stopPropagation();
+    };
+    document.addEventListener('keydown', onKey, true);
+    document.body.append(bg);
+    upd.box = { bg, title, notes, more, progress, bar, pct, row, onKey };
+    return upd.box;
+  }
+  const updButtons = (b, list) => {
+    b.row.replaceChildren(...list.map(([id, label, primary]) => el('button', { class: 'btn' + (primary ? ' primary' : ''), dataset: { fk: 'upd-' + id }, onclick: () => updClick(id) }, label)));
+    const p = b.row.querySelector('.primary');
+    if (p) p.focus();
+  };
+  function updClick(id) {
+    if (id === 'download') {
+      updAnswer('download');
+      if (upd.mode === 'install') { upd.stage = 'downloading'; updateEvent({ type: 'progress', percent: 0 }); }
+      else closeUpdate();   // the release page opens in the browser
+    } else if (id === 'skip') { updAnswer('skip'); closeUpdate(); }
+    else if (id === 'later') updDismiss();
+    else if (id === 'restart') { updAnswer('restart'); upd.stage = 'restarting'; upd.box.row.replaceChildren(); }
+  }
+  function updateEvent(ev) {
+    if (!ev || !ev.type) return;
+    if (ev.type === 'checking') { toast('Checking for updates\u2026'); return; }
+    if (ev.type === 'none') { toast('You\u2019re up to date.'); return; }
+    if (ev.type === 'error') {
+      closeUpdate();
+      toast((ev.during === 'download' ? 'The update couldn\u2019t be downloaded: ' : ev.during === 'install' ? 'The update couldn\u2019t be installed: '
+        : 'Couldn\u2019t check for updates: ') + ev.message);
+      return;
+    }
+    if (ev.type === 'available') {
+      Object.assign(upd, { stage: 'available', version: String(ev.version), mode: ev.mode === 'install' ? 'install' : 'notify' });
+      const b = updateModal();
+      b.title.textContent = 'Version ' + upd.version + ' is available';
+      b.notes.textContent = ev.notes || '';
+      b.notes.hidden = !ev.notes;
+      b.more.replaceChildren(linkEl(ev.url || LINKS.releases, 'Full release notes', 'upd-notes-link'));
+      b.more.hidden = false;
+      b.progress.hidden = true;
+      updButtons(b, [['skip', 'Skip this version'], ['later', 'Remind me later'],
+        upd.mode === 'install' ? ['download', 'Download and install', true] : ['download', 'Download', true]]);
+      return;
+    }
+    if (ev.type === 'progress') {
+      if (!upd.box) return;
+      upd.stage = 'downloading';
+      const p = Math.max(0, Math.min(100, Math.round(ev.percent || 0)));
+      upd.box.progress.hidden = false;
+      upd.box.bar.firstChild.style.width = p + '%';
+      upd.box.pct.textContent = 'Downloading\u2026 ' + p + '\u202f%';
+      upd.box.row.replaceChildren();
+      return;
+    }
+    if (ev.type === 'downloaded') {
+      Object.assign(upd, { stage: 'downloaded', version: String(ev.version) });
+      const b = updateModal();
+      b.title.textContent = 'Version ' + upd.version + ' is ready';
+      b.notes.hidden = !b.notes.textContent;
+      b.more.hidden = !b.more.textContent;
+      b.progress.hidden = true;
+      updButtons(b, [['later', 'Later'], ['restart', 'Restart to update', true]]);
+    }
+  }
+  window.__updates = { event: updateEvent, close: closeUpdate, get stage() { return upd.stage; }, actions: upd.actions };
+  if (shellBridge && shellBridge.onUpdate) shellBridge.onUpdate(updateEvent);
 
   // ------------------------------------------------------------------ toast + modal
   let toastTimer;
@@ -3513,15 +5040,59 @@
   // ------------------------------------------------------------------ device page + capture info
   // Decoded from the phone app (trace 2026-10-09, docs/INVESTIGATION.md §11). Not in the upstream editor.
   //   46 {1:3 3:unixTime} → 47 {1:1 3:1 4:"" 5:firmware 6:serial 7:hash}            device info
-  //   65 {1:3}            → 66 {1:1 3:1 5:name 6:brightness … 17:usbDb(f32) …}       global settings
+  //   65 {1:3}            → 66 {1:1 3:1 5:name 6:brightness … 15:muteIn 16:muteOut 17:usbDb(f32) …} global settings
   //   67 {1:1 4:brightness 14:usbDb(f32)} → 68 {1:1 3:1}                           write (the app sends both)
+  //   67 {1:1 12:muteIn} → 68 {1:1 3:1}; 67 {1:1 13:muteOut} → 68 {1:1 3:1}    monitoring writes (one field, explicit 0/1)
   //   17 {3:captureSlot−1 5:1} → 18 {1:6 3:1 7:{1,2 author} 8:"" 9:hash 10:name 11:record}   capture details
   //   91 {1:3}            → 92 {1:3 3:1 5:"2.2.1+06d34443" 6:serial 7:name}        keep-alive; full firmware + name
   // Settings writes are global: no Save, and the pedal reports nothing dirty (no 115 after them in the trace).
   const DEV_MSG = { ALIVE_REQ: 91, ALIVE: 92, INFO_REQ: 46, INFO: 47, SETTINGS_REQ: 65, SETTINGS: 66, SET: 67, SET_ACK: 68, CAPTURE_REQ: 17, CAPTURE: 18 };
+  const DEV_MONITOR = Object.freeze({
+    muteInput: { writeField: 12, readField: 15, tag: 0x60, label: 'Mute Input', note: 'Mutes the Guitar Input. USB input remains available.' },
+    muteOutput: { writeField: 13, readField: 16, tag: 0x68, label: 'Mute Outputs 1L/2R', note: 'Mutes processed audio to Outputs 1L/2R. USB playback remains available.' },
+  });
   const USB_DB = { min: -20, max: 0, step: 0.5 };
-  const dev = { info: null, alive: null, settings: null, reading: false, redraw: null, capWait: null };
+  const dev = { info: null, alive: null, settings: null, reading: false, redraw: null, capWait: null,
+    monitorPending: {}, monitorAcks: [], monitorReadTimer: null, muteInputRevision: 0,
+    settingsRequestedForConnection: false };
   window.__dev = dev;
+  // Tuner and Mute Input: the pedal still reports the input muted after the tuner closes, but its audio path needs a
+  // fresh off → on edge to mute again (seen on a pedal, #14). So: note the mute when the tuner opens; when it closes,
+  // wait for the tuner-off write, let the pedal settle 200 ms, then send off and, 100 ms after that write, on again,
+  // unless the user changed the mute meanwhile.
+  let tunerMuteSnapshot = null;
+  const coreOpenTuner = window.openTuner;
+  window.openTuner = function () {
+    tunerMuteSnapshot = state.connected && dev.settings ? { muted: Boolean(dev.settings.muteInput), revision: dev.muteInputRevision } : null;
+    return coreOpenTuner.apply(this, arguments);
+  };
+  const coreCloseTuner = window.closeTuner;
+  window.closeTuner = function () {
+    const wasOpen = state.tuner.open;
+    const snapshot = wasOpen ? tunerMuteSnapshot : null;
+    if (wasOpen) tunerMuteSnapshot = null;
+    const result = coreCloseTuner.apply(this, arguments);
+    if (snapshot && snapshot.muted && state.connected) {
+      // Writes leave in order, so an empty queue means the tuner-off write (if any) has gone out.
+      waitUntil(() => !gattWriteQueue.length && !gattWritePumpRunning, 3000)
+        .then(() => new Promise(r => setTimeout(r, 200)))
+        .then(() => rearmInputMute(snapshot));
+    }
+    return result;
+  };
+  function rearmInputMute(snapshot) {
+    if (!state.connected || state.tuner.open || !dev.settings || dev.muteInputRevision !== snapshot.revision) return;
+    const off = writeMonitorSetting('muteInput', false);
+    const revision = dev.muteInputRevision;
+    if (!off) return;
+    off.then((sent) => {
+      if (!sent) return;
+      setTimeout(() => {
+        if (!state.connected || state.tuner.open || dev.muteInputRevision !== revision) return;
+        writeMonitorSetting('muteInput', true);
+      }, 100);
+    });
+  }
   // Varint that stays exact past 2^31 (the Unix time is close to it).
   const varint = (n) => { const out = []; n = Math.max(0, Math.floor(n)); while (n > 127) { out.push((n % 128) | 128); n = Math.floor(n / 128); } out.push(n); return out; };
   // A typed frame whose body may pass 255 bytes: bit 0 of the flags byte is the length's ninth bit.
@@ -3539,10 +5110,21 @@
   function readDevice() {
     if (!state.connected) return;
     dev.reading = true;
-    writeC304('Read device settings', buildFrame([0x08, 0x03], DEV_MSG.SETTINGS_REQ));
+    requestDeviceSettings();
     writeC304('Read device info', buildFrame([0x08, 0x03, 0x18, ...varint(Date.now() / 1000)], DEV_MSG.INFO_REQ));
     writeC304('Keep-alive', buildFrame([0x08, 0x03], DEV_MSG.ALIVE_REQ));
     if (dev.redraw) dev.redraw();
+  }
+  function requestDeviceSettings() {
+    if (!state.connected) return;
+    writeC304('Read device settings', buildFrame([0x08, 0x03], DEV_MSG.SETTINGS_REQ));
+  }
+  function requestMonitorRead() {
+    clearTimeout(dev.monitorReadTimer);
+    dev.monitorReadTimer = setTimeout(() => {
+      dev.monitorReadTimer = null;
+      requestDeviceSettings();
+    }, 20);
   }
   // One write carries both values, like the app: the one not being changed is resent as it is.
   // Coalesced while a slider is dragged (only the latest queued write goes out).
@@ -3555,6 +5137,38 @@
     Object.assign(s, { brightness: b, usbDb: db });
     writeC304('Device settings: LED brightness ' + b + ', USB playback ' + db.toFixed(1) + ' dB',
       buildFrame([0x08, 0x01, 0x20, ...varint(b), 0x75, ...float32LE(db)], DEV_MSG.SET), 'device-settings');
+  }
+
+  // Monitoring writes are deliberately independent of the brightness/USB write coalescer:
+  // each click is a complete, ordered command and never waits for a pedal reply.
+  function writeMonitorSetting(key, value) {
+    const spec = DEV_MONITOR[key], s = dev.settings;
+    if (!state.connected || !s || !spec) return;
+    if (key === 'muteInput') dev.muteInputRevision++;
+    const previous = Boolean(s[key]);
+    const prior = dev.monitorPending[key];
+    const seq = (prior ? prior.seq : 0) + 1;
+    const pending = { key, value: Boolean(value), previous, seq };
+    dev.monitorPending[key] = pending;
+    s[key] = pending.value;
+    const frame = buildFrame([0x08, 0x01, spec.tag, pending.value ? 1 : 0], DEV_MSG.SET);
+    const ack = { ...pending, sent: false };
+    dev.monitorAcks.push(ack);
+    const writePromise = writeC304('Device monitoring: ' + spec.label + ' ' + (pending.value ? 'ON' : 'OFF'), frame);
+    writePromise.then((ok) => {
+      ack.sent = ok;
+      if (!ok) {
+        const i = dev.monitorAcks.indexOf(ack);
+        if (i >= 0) dev.monitorAcks.splice(i, 1);
+      }
+      if (ok || dev.monitorPending[key] !== pending) return;
+      delete dev.monitorPending[key];
+      s[key] = previous;
+      if (key === 'muteInput') renderMuteButton();
+      if (dev.redraw) dev.redraw();
+    });
+    if (key === 'muteInput') renderMuteButton();
+    return writePromise;
   }
 
   function onDeviceInfo(d) {
@@ -3573,30 +5187,65 @@
       const v = x.wire === 0 ? String(x.value) : x.wire === 5 ? String(Math.round(pf.f32(f, n) * 100) / 100) : x.wire === 2 ? JSON.stringify(pf.str(f, n)) : hex(x.raw);
       return n + '=' + v;
     });
-    // Protobuf leaves out zeros, so an absent field reads 0.
-    dev.settings = { name: pf.str(f, 5), brightness: pf.int(f, 6) || 0, usbDb: pf.f32(f, 17) || 0, raw };
-    log('Device settings: "' + dev.settings.name + '", LED brightness ' + dev.settings.brightness + ', USB playback ' + dev.settings.usbDb.toFixed(1) + ' dB');
+    // Protobuf leaves out zeros, so an absent field reads 0. A pending local
+    // write wins over an older unsolicited/readback report until its value is seen.
+    const next = { name: pf.str(f, 5), brightness: pf.int(f, 6) || 0, usbDb: pf.f32(f, 17) || 0, raw };
+    for (const [key, spec] of Object.entries(DEV_MONITOR)) {
+      const reported = Boolean(pf.int(f, spec.readField) || 0);
+      const pending = dev.monitorPending[key];
+      if (pending && reported !== pending.value) next[key] = pending.value;
+      else {
+        next[key] = reported;
+        if (pending) delete dev.monitorPending[key];
+      }
+    }
+    dev.settings = next;
+    renderMuteButton();
+    log('Device settings: "' + dev.settings.name + '", LED brightness ' + dev.settings.brightness + ', USB playback ' + dev.settings.usbDb.toFixed(1) + ' dB, input mute ' + (dev.settings.muteInput ? 'on' : 'off') + ', output mute ' + (dev.settings.muteOutput ? 'on' : 'off'));
     dev.reading = !dev.info;
     if (dev.redraw) dev.redraw();
   }
   function onAlive(d) {
     const f = bodyOf(d);
     dev.alive = { firmware: pf.str(f, 5), serial: pf.str(f, 6), name: pf.str(f, 7) };
+    if (ui.previewing || irAudition.active) {
+      const accepted = Boolean(f[3] && f[3][0] && f[3][0].value === 1);
+      log('Live preview keep-alive ' + (accepted ? 'acknowledged.' : 'was not accepted.'));
+    }
     if (dev.redraw) dev.redraw();
   }
   function onSettingsAck(d) {
     const ok = pf.int(bodyOf(d), 3) === 1;
     log('Device settings ' + (ok ? 'confirmed' : 'REFUSED: ' + hex(d)));
+    const ack = dev.monitorAcks[0];
+    // A type-68 has no setting discriminator. Do not consume a monitoring
+    // record until its own queued write has completed; this keeps an earlier
+    // brightness/USB ACK from being mistaken for a mute ACK.
+    if (!ack || !ack.sent) return;
+    dev.monitorAcks.shift();
+    const pending = dev.monitorPending[ack.key];
+    if (!ok) {
+      if (pending && pending.seq === ack.seq) {
+        delete dev.monitorPending[ack.key];
+        if (dev.settings) dev.settings[ack.key] = ack.previous;
+        if (ack.key === 'muteInput') renderMuteButton();
+        if (dev.redraw) dev.redraw();
+      }
+      return;
+    }
+    requestMonitorRead();
   }
   function onCaptureDetails(d) {
     const f = bodyOf(d);
     const rec = pf.sub(f, 11);           // byte-identical to state field 34 for the active capture
     const by = pf.sub(f, 7), recBy = pf.sub(rec, 4);
+    const desc = NanoText.storedDescription(pf.str(f, 8)) || pf.str(rec, 5);   // 18.8, else the record's own field 5
     const info = {
       ok: pf.int(f, 3) === 1,
       name: pf.str(f, 10) || pf.str(rec, 2),
       author: pf.str(by, 2) || pf.str(by, 1) || pf.str(recBy, 2) || pf.str(recBy, 1),
-      description: pf.str(f, 8),         // unverified: empty in every reply so far
+      description: NanoText.captureDescription(desc),   // "", blank, "null" or a bare Cloud ID: none
+      cloudId: NanoText.captureCloudId(desc),           // the description is the capture's Cortex Cloud ID
       hash: pf.str(f, 9) || pf.str(rec, 1),
       type: pf.str(rec, 6), instrument: pf.str(rec, 10), tags: pf.strs(rec, 7),
     };
@@ -3672,10 +5321,12 @@
       usbNum.addEventListener('change', typed);
       usbNum.addEventListener('focus', () => usbNum.select());
       usbNum.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); typed(); usbNum.select(); } });
+      const muteInput = toggleSwitch('dev-mute-input', 'Mute Input', !!(s && s.muteInput), (v) => writeMonitorSetting('muteInput', v), !can);
+      const muteOutput = toggleSwitch('dev-mute-output', 'Mute Outputs 1L/2R', !!(s && s.muteOutput), (v) => writeMonitorSetting('muteOutput', v), !can);
       const again = el('button', { class: 'btn small', dataset: { fk: 'dev-read' }, disabled: on ? null : 'true', onclick: () => readDevice() }, 'Read again');
       const raw = el('details', { class: 'dev-raw', dataset: { fk: 'dev-raw' } }, el('summary', { text: 'Raw settings' }),
         el('p', { class: 'set-note', text: s ? '66: ' + s.raw.join('  ') : 'Not read yet.' }),
-        el('p', { class: 'set-note', text: 'Read only. These fields are not mapped to settings yet.' }));
+        el('p', { class: 'set-note', text: 'Read only. Other fields are not mapped to settings yet.' }));
       const setting = (title, note, ...ctl) => el('div', { class: 'dev-setting' },
         el('div', { class: 'dev-text' }, el('div', { class: 'dev-title', text: title }), el('div', { class: 'dev-note', text: note })),
         el('div', { class: 'dev-ctl' }, ...ctl));
@@ -3690,6 +5341,10 @@
         el('section', {},
           setting('LED brightness', 'The pedal’s LEDs. The manual’s default is 60%.', bri, briVal),
           setting('USB playback volume', 'Audio from the computer over USB. Default −6.0 dB.', usb, usbNum, el('span', { class: 'set-unit', text: 'dB' }))),
+        el('section', {},
+          el('h3', { text: 'Monitoring' }),
+          setting('Mute Guitar Input', DEV_MONITOR.muteInput.note, muteInput),
+          setting('Mute Guitar Output', DEV_MONITOR.muteOutput.note, muteOutput)),
         el('section', { class: 'dev-only' }, raw),
         el('div', { class: 'dev-foot' }, setNote('Global settings: they apply on the pedal right away, not per preset.'), again)].filter(Boolean));
     };
@@ -3701,6 +5356,11 @@
 
   // Capture info: "Info…" in the capture node's and the capture slots' context menus. A popover like the native
   // app's: slot, name, author, kind icons, tag chips, description, hash with Copy. slot is 1-based.
+  // A capture whose description is just its Cortex Cloud ID gets "Open in Cortex Cloud" there instead: the shell
+  // (nanoShell.openCloudCapture → src/main.js) loads that capture's page in the Cloud tab. Nothing goes to the pedal.
+  // Without the shell (the web preview) there is no Cloud tab, so no button. The UX test sets its own opener.
+  let openCloudCapture = shellBridge && shellBridge.openCloudCapture ? (id) => shellBridge.openCloudCapture(id) : null;
+  window.__setCloudCaptureOpener = (fn) => { openCloudCapture = typeof fn === 'function' ? fn : null; };
   const slotLabel = (slot) => Math.ceil(slot / 5) + 'ABCDE'[(slot - 1) % 5];
   const shortHash = (h) => (h && h.length > 16 ? h.slice(0, 8) + '…' + h.slice(-6) : h || '');
   async function openCaptureInfo(slot, anchor) {
@@ -3738,12 +5398,24 @@
       try { await navigator.clipboard.writeText(info.hash); copy.textContent = 'Copied'; } catch { copy.textContent = 'Copy failed'; }
       setTimeout(() => { copy.textContent = 'Copy'; }, 1200);
     } }, 'Copy');
-    box.replaceChildren(
+    // replaceChildren() would turn a left-out part (null) into the text "null": that was the "null" under the tags.
+    box.replaceChildren(...[
       info.author ? el('div', { class: 'cap-by', dataset: { fk: 'cap-author' } }, 'by ' + info.author) : null,
       kinds.length ? el('div', { class: 'cap-kinds' }, kinds) : null,
       info.tags.length ? el('div', { class: 'chips', dataset: { fk: 'cap-tags' } }, info.tags.map(t => el('span', { class: 'chip', text: t }))) : null,
       info.description ? el('p', { class: 'cap-desc', text: info.description, dataset: { fk: 'cap-desc' } }) : null,
-      el('div', { class: 'cap-hash dev-only' }, el('span', { class: 'k', text: 'Hash' }), el('span', { class: 'v', text: shortHash(info.hash) || '—', title: info.hash || null, dataset: { fk: 'cap-hash' } }), copy));
+      info.cloudId && openCloudCapture ? el('button', {
+        class: 'btn ghost small cap-cloud', type: 'button', dataset: { fk: 'cap-cloud-link' },
+        title: 'Open this capture\u2019s page in the Cortex Cloud tab',
+        onclick: () => {
+          const id = info.cloudId;
+          closePopover();
+          log('Opening capture ' + id + ' in Cortex Cloud');
+          Promise.resolve(openCloudCapture(id)).catch(() => {});
+        },
+      }, 'Open in Cortex Cloud') : null,
+      el('div', { class: 'cap-hash dev-only' }, el('span', { class: 'k', text: 'Hash' }), el('span', { class: 'v', text: shortHash(info.hash) || '—', title: info.hash || null, dataset: { fk: 'cap-hash' } }), copy),
+    ].filter(Boolean));
     place();
   }
   window.__openCaptureInfo = openCaptureInfo;
@@ -3788,10 +5460,38 @@
     }, !shellBridge);
 
     // Metronome (same "metronome" key as the overlay)
-    const sound = el('select', { class: 'select', 'aria-label': 'Click sound', dataset: { fk: 'set-sound' },
-      onchange: (e) => { metro.sound = e.target.value; saveMetro(); } },
-      Object.entries(VOICES).map(([id, v]) => el('option', { value: id, selected: id === metro.sound }, v.name)));
-    const preview = el('button', { class: 'btn small', dataset: { fk: 'set-preview' }, onclick: previewSound }, 'Preview');
+    // Sounds: per role a menu (the built-in voices, the custom sample when set, "Custom sample…"), ▶, and with a custom
+    // sample its file name and Reset. Picking a built-in while a sample is set also drops the sample.
+    const playIcon = () => { const i = sv('svg', { width: '10', height: '10', viewBox: '0 0 10 10', 'aria-hidden': 'true' }); i.append(sv('path', { d: 'M2.2 1.3v7.4L8.6 5z', fill: 'currentColor' })); return i; };
+    const soundMsg = el('p', { class: 'set-note snd-msg', hidden: true, dataset: { fk: 'set-sound-msg' } });
+    const showSoundMsg = (text) => { soundMsg.textContent = text || ''; soundMsg.hidden = !text; };
+    const soundRow = (role, label) => {
+      const ctl = el('div', { class: 'set-ctl' });
+      const draw = (focus) => {
+        const custom = metro.samples[role];
+        const sel = el('select', { class: 'select', 'aria-label': label + ' sound', dataset: { fk: 'set-sound-' + role } },
+          VOICE_IDS.map(id => el('option', { value: id, selected: !custom && id === metro.sounds[role] }, VOICES[id].name)),
+          custom ? el('option', { value: 'custom', selected: true }, 'Custom') : null,
+          el('hr'),
+          el('option', { value: 'pick', disabled: samples.bridge ? null : 'true' }, 'Custom sample\u2026'));
+        sel.addEventListener('change', async () => {
+          const v = sel.value;
+          sel.disabled = true;
+          if (v === 'pick') { const r = await pickSample(role); if (!r.canceled) showSoundMsg(r.error); }
+          else if (VOICE_IDS.includes(v)) { await resetSample(role); metro.sounds[role] = v; saveMetro(); showSoundMsg(''); }
+          draw(true);
+        });
+        ctl.replaceChildren(sel,
+          el('button', { class: 'btn small snd-play', title: 'Play', 'aria-label': 'Play ' + label, dataset: { fk: 'set-play-' + role }, onclick: () => previewSound(role) }, playIcon()),
+          ...(custom ? [
+            el('span', { class: 'set-unit snd-file', text: custom.name, title: custom.name, dataset: { fk: 'set-file-' + role } }),
+            el('button', { class: 'btn small', dataset: { fk: 'set-reset-' + role }, onclick: async () => { await resetSample(role); showSoundMsg(''); draw(true); } }, 'Reset'),
+          ] : []));
+        if (focus) sel.focus();
+      };
+      draw(false);
+      return el('div', { class: 'set-row', dataset: { fk: 'set-snd-' + role } }, el('span', { class: 'set-label', text: label }), ctl);
+    };
     const out = el('select', { class: 'select', 'aria-label': 'Audio output', dataset: { fk: 'set-output' } });
     const drawOut = () => {
       out.replaceChildren(...[{ id: '', label: 'System default' }, ...metro.outputs].map(o => el('option', { value: o.id, text: o.label })));
@@ -3837,6 +5537,8 @@
     const auto = toggleSwitch('set-autoconnect', 'Reconnect to the last pedal at launch', shellBridge && pref.get('autoConnect', false), (v) => pref.set('autoConnect', v), !shellBridge);
 
     // Advanced
+    const updSwitch = toggleSwitch('set-autoupdate', 'Check for updates automatically', shellInfo ? shellInfo.autoUpdate !== false : false,
+      (v) => { if (shellBridge && shellBridge.setAutoUpdate) shellBridge.setAutoUpdate(v).catch(() => {}); }, !shellBridge);
     const devSwitch = toggleSwitch('set-devtools', 'Developer tools', devTools, setDevTools);
     const drawerAtLaunch = toggleSwitch('set-drawer', 'Show the Activity drawer at launch', pref.get('drawerAtLaunch', false), (v) => pref.set('drawerAtLaunch', v));
     const reveal = el('button', { class: 'btn small', dataset: { fk: 'set-reveal' }, disabled: !shellBridge ? 'true' : null,
@@ -3847,7 +5549,6 @@
         setRow('Accent colour', swatches),
         setRow('', dock), !shellBridge ? setNote(iconWord + ': ' + desktopOnly.toLowerCase()) : null),
       el('section', {}, el('h3', { text: 'Metronome' }),
-        setRow('Click sound', sound, preview),
         setRow('Output', out),
         setRow('Volume', vol),
         setRow('Default tempo', bpm, el('span', { class: 'set-unit', text: 'BPM' })),
@@ -3858,11 +5559,16 @@
         setRow('Pattern', patSel, el('span', { class: 'set-unit', text: 'Advanced mode' })),
         setRow('Subdivision', subSel),
         setRow('Count-in', ciSel),
-        ...lvls.map(x => setRow(x.label + ' level', x.r, x.val))),
+        ...lvls.map(x => setRow(x.label + ' level', x.r, x.val)),
+        el('h4', { class: 'set-sub', text: 'Sounds' }),
+        ...SOUND_ROLES.map(([role, label]) => soundRow(role, label)),
+        soundMsg),
       el('section', {}, el('h3', { text: 'Connection' }),
         setRow('', auto),
         setRow('', pedalLine, shellBridge ? forget : null)),
       el('section', {}, el('h3', { text: 'Advanced' }),
+        setRow('', updSwitch),
+        setNote(shellBridge ? 'Checks GitHub for new versions.' : desktopOnly, 'set-autoupdate-note'),
         setRow('', devSwitch),
         setNote('Shows the Activity log, session recording and protocol details. For troubleshooting and development.', 'set-devtools-note'),
         devOnly(setRow('', drawerAtLaunch)),
@@ -3990,11 +5696,16 @@
   $('supportBtn').addEventListener('click', () => openLink(LINKS.support));
   $('renameBtn').addEventListener('click', doRename);
   $('tunerBtn').addEventListener('click', toggleTuner);
+  $('muteBtn').addEventListener('click', () => {
+    if (!state.connected || !dev.settings) return;
+    writeMonitorSetting('muteInput', !dev.settings.muteInput);
+  });
   $('chain').addEventListener('pointerdown', onStagePointerDown);
   $('chain').addEventListener('click', onStageClick, true);
   $('chain').addEventListener('contextmenu', onStageContextMenu, true);
   $('inspector').addEventListener('pointerdown', onInspectorPointerDown);
   $('inspector').addEventListener('click', onInspectorClick, true);
+  $('presetList').addEventListener('pointerdown', onPresetPointerDown);
   $('presetFilter').addEventListener('input', (e) => { ui.filter = e.target.value; renderSide(); });
   $('presetFilter').addEventListener('keydown', (e) => {
     if (e.key === 'Enter') {
@@ -4043,6 +5754,22 @@
     const FULL_IR = (n) => 'Factory/' + IRS[n - 1].split('/')[1] + '/' + IR_NAME(n);
 
     const saved = new Map(); // preset -> snapshot JSON
+    // Which of the demo's sounds each preset slot holds (a preset move reorders them).
+    const origin = Array.from({ length: 64 }, (_, i) => i + 1);
+    const moved = { names: null, current: 0 };   // what the next metadata / state read reports after a move
+    function movePresets(from, to) {
+      if (!(from >= 0 && from < 64 && to >= 0 && to < 64) || from === to) return;
+      const after = (i) => (i === from ? to : from < to && i > from && i <= to ? i - 1 : from > to && i >= to && i < from ? i + 1 : i);
+      const remap = (map) => { const out = new Map(); for (const [n, v] of map) out.set(after(n - 1) + 1, v); map.clear(); for (const [n, v] of out) map.set(n, v); };
+      const names = Array.from({ length: 64 }, (_, i) => presetName(i + 1));
+      const o = origin.slice();
+      const nextNames = [];
+      for (let i = 0; i < 64; i++) { nextNames[after(i)] = names[i]; origin[after(i)] = o[i]; }
+      [saved, expSaved, expLive].forEach(remap);
+      FS_FIELDS.forEach(([key]) => { fsSlots[key] = after(fsSlots[key]); });
+      moved.names = nextNames;
+      moved.current = after(state.selectedPreset - 1) + 1;
+    }
     // The (demo) pedal's footswitch slots, 0-based preset indices; reported in the state dump as fields 14/15/38/39.
     const fsSlots = { a1: 0, b1: 2, a2: 6, b2: 14 };
     const FS_FIELDS = [['a1', 5], ['b1', 6], ['a2', 7], ['b2', 8]];
@@ -4105,7 +5832,7 @@
     // Library stored on the (demo) pedal.
     const cap = (name, index, author, type = 'amp_head', instrument = 'guitar') => ({ index, name, type, tags: [], instrument, author, description: '', corrupted: false });
     // Types vary so the library picker shows its icon set (CAPTURE_KINDS).
-    const FACTORY_TYPES = ['amp_head', 'amp_head', 'amp_head', 'combo', 'combo', 'amp_head', 'pedal', 'pedal'];
+    const FACTORY_TYPES = ['amp_head', 'amp_head', 'amp_head', 'combo', 'amp_combo', 'amp_head', 'pedal', 'pedal'];   // amp_combo: a real pedal's word
     const LIB = {
       factory: ['Plexi 1959 SLP', 'JCM800 2203 Lead', 'Recto Modern Red', 'AC30 TB Normal', 'Deluxe Reverb Clean', 'SVT CL Bass', 'Fuzz Face Si', 'King of Tone']
         .map((n, i) => cap(n, i, 'Neural DSP', FACTORY_TYPES[i], i === 5 ? 'bass' : 'guitar')),
@@ -4118,8 +5845,40 @@
     const reply = (frame) => setTimeout(() => handleTypedMessage(frame), 30);
     const notify = (frame) => setTimeout(() => window.onC305({ target: { value: { buffer: frame.buffer.slice(frame.byteOffset, frame.byteOffset + frame.byteLength) } } }), 30);
     const reassemble = NanoTransfer.makeReassembler();
+    const hooks = {};   // test hooks (window.__demo.hooks): refuseStop, stopDelay, dropStateReads, quiet115, writeDelay
+    // A capture audition on the (demo) pedal. While it plays, a state read reports the previewed capture as the current
+    // one, as the pedal does; after the stop the next read reports the preset's own capture again.
+    const audition = { capture: '', presetCapture: null };
+    const firstField = (fields, n) => fields[n] && fields[n][0];
+    const textField = (fields, n) => {
+      const x = firstField(fields, n);
+      return x && x.wire === 2 ? new TextDecoder().decode(Uint8Array.from(x.raw)) : '';
+    };
+    const previewReply = (body) => {
+      const f = parseProtoFields(body);
+      const object = firstField(f, 5);
+      const objectFields = object && object.wire === 2 ? parseProtoFields(object.raw) : {};
+      const record = firstField(objectFields, 2);
+      const recordFields = record && record.wire === 2 ? parseProtoFields(record.raw) : {};
+      const name = textField(recordFields, 2) || 'Demo preview';
+      const hash = textField(recordFields, 1);
+      audition.capture = name;
+      const enc = (s) => Array.from(new TextEncoder().encode(s));
+      const replyRecord = [0x12, enc(name).length, ...enc(name), 0x1A, enc(hash).length, ...enc(hash)];
+      notify(buildFrame([0x08, 0x06, 0x18, 0x01, 0x22, replyRecord.length, ...replyRecord], NanoTransfer.MSG_PREVIEW_CAPTURE_REPLY));
+    };
+    // 15 { 3: { 1: WAV, 2: MD5 }, 4: product id, 5: file name } → 16 { 1: 6, 3: 1, 4: { 1: index, 2: name } }
+    const irDownloadReply = (body) => {
+      const f = parseProtoFields(body);
+      const name = textField(f, 5).replace(/\.wav$/i, '') || 'Cloud IR';
+      const index = LIB.irUser.length;
+      LIB.irUser.push({ index, name });
+      const enc = Array.from(new TextEncoder().encode(name));
+      const record = [0x08, index, 0x12, enc.length, ...enc];
+      notify(buildFrame([0x08, 0x06, 0x18, 0x01, 0x22, record.length, ...record], NanoTransfer.MSG_DOWNLOAD_IR_REPLY));
+    };
     function onWrite(bytes) {
-      // Streamed (multi-write) messages: only capture uploads so far.
+      // Streamed (multi-write) messages: capture uploads and live previews.
       if (bytes.length >= 2 && (bytes[1] & 0xC0) !== 0xC0) {
         const whole = reassemble(bytes);
         if (!whole) return;
@@ -4134,13 +5893,38 @@
           const enc = (s) => Array.from(new TextEncoder().encode(s));
           const record = [0x08, index, 0x12, enc(name).length, ...enc(name), 0x1A, enc(hash).length, ...enc(hash)];
           notify(buildFrame([0x08, 0x06, 0x18, 0x01, 0x22, record.length, ...record], NanoTransfer.MSG_UPLOAD_CAPTURE_REPLY));
-        }
+        } else if (t === NanoTransfer.MSG_PREVIEW_CAPTURE) previewReply(whole.slice(0, whole.length - 4));
+        else if (t === NanoTransfer.MSG_DOWNLOAD_IR) irDownloadReply(Array.from(whole.slice(0, whole.length - 4)));
         return;
       }
       const type = frameType(bytes);
       // State and metadata reads get no reply here; pretend they completed so the
       // core's "one read at a time" guard doesn't block later requests.
       if (state.stateMode === 'current' || state.stateMode === 'metadata') setTimeout(() => { if (state.stateMode !== 'library') state.stateMode = 'idle'; }, 20);
+      // A current-state read (1 {1:3 3:1 4:1 5:1}) completes like the core's parse would end it: the preset load is
+      // over and the read counts (pro/live-sync.js). Test hook: hooks.dropStateReads leaves it unanswered.
+      if (type === 1 && bytes[4] === 0x18 && bytes[5] === 0x01 && !hooks.dropStateReads) {
+        setTimeout(() => {
+          if (state.stateMode === 'current') state.stateMode = 'idle';
+          state.protocol.presetLoad = false;
+          if (moved.current) { state.selectedPreset = moved.current; moved.current = 0; applyStateDump(); }   // field 13 and the footswitches
+          if (audition.capture) {   // the dump's capture, as the core's parse sets it
+            if (!audition.presetCapture) audition.presetCapture = { ...state.currentCapture };
+            state.currentCapture = { name: audition.capture, id: '', inBank: [...state.captureNames.values()].some(n => sameName(n, audition.capture)) };
+          } else if (audition.presetCapture) { state.currentCapture = audition.presetCapture; audition.presetCapture = null; }
+          NanoLive.noteStateRead();
+          render();
+        }, 20);
+      }
+      // The metadata read (1 {1:3}): the preset list as the pedal now has it (after a move: in the new order).
+      if (type === 1 && bytes.length === 8 && bytes[4] === 0x01) {
+        setTimeout(() => {
+          if (moved.names) { moved.names.forEach((name, i) => state.presetNames.set(i + 1, name)); moved.names = null; }
+          Object.assign(state.protocol, { feSyncComplete: true, metadataLoaded: true });
+          if (state.stateMode === 'metadata') state.stateMode = 'idle';
+          render();
+        }, 20);
+      }
       if (type === MSG.SetPresetSlotsRequest) {
         // Field 4 = -1 (parsed as a huge number): a footswitch assignment, not a preset change. Keep the slots
         // the next state dump reports, and ack like the pedal did in the trace (31, then 30 via onC305).
@@ -4161,6 +5945,14 @@
         else notify(buildFrame([0x08, 0x01, 0x18, 0x01, 0x2D, ...float32LE(tempoRun)], TEMPO_MSG));   // the echo
       }
       else if (type === MSG.RenamePresetRequest) reply(buildFrame([0x20, 0x01], MSG.RenamePresetResponse));
+      else if (type === MSG_PRESET_MOVE) {
+        // 143 { 1: 4, 3: from, 4: to } → 144 { 1: 6, 3: from, 4: to, 5: 1 }: the demo pedal moves the preset (and what
+        // it stores for it) by insertion; its current preset and footswitches follow the presets.
+        const f = framePayloadFields(bytes);
+        const from = f[3] ? f[3][0].value : 0, to = f[4] ? f[4][0].value : 0;
+        movePresets(from, to);
+        notify(buildFrame([0x08, 0x06, 0x18, from, 0x20, to, 0x28, 0x01], MSG_PRESET_MOVE_REPLY));
+      }
       else if (type === 50) { const idx = bytes[5]; notify(buildFrame([0x08, 0x01], 31)); notify(buildFrame([0x08, 0x06, 0x18, idx, 0x20, 0x01], 51)); }   // via onC305, where the delete ack is read
       else if (type === MSG.RetrieveExpAssignmentsRequest) {
         // 60 {1:3 3:index} → 64 {1:1 3:2} (meaning unknown, seen in the trace) and 61 {1:1, records at field − 1}.
@@ -4179,8 +5971,19 @@
       }
       else if ([26, 28, 31, 94, 99, 136].includes(type)) {
         // Demo writes model the pedal: edit writes become dirty only through
-        // the simulated pedal's authoritative type-115 report.
-        notify(buildFrame([0x08, 0x01, 0x18, 0x01], MSG.PresetDirtyStateChanged));
+        // the simulated pedal's authoritative type-115 report (test hook: hooks.quiet115 leaves it out).
+        if (!hooks.quiet115) notify(buildFrame([0x08, 0x01, 0x18, 0x01], MSG.PresetDirtyStateChanged));
+      }
+      else if (type === NanoLive.MSG.DeleteLibraryIRRequest) {
+        const f = framePayloadFields(bytes);
+        const record = f[4] && f[4][0] ? parseProtoFields(f[4][0].raw) : {};
+        const index = record[1] && record[1][0] ? record[1][0].value : -1;
+        const removed = LIB.irUser.some(item => item.index === index);
+        if (removed) {
+          LIB.irUser = LIB.irUser.filter(item => item.index !== index);
+          LIB.irUser.forEach((item, nextIndex) => { item.index = nextIndex; });
+        }
+        notify(buildFrame([0x08, 0x06, 0x18, removed ? 0x01 : 0x00], NanoLive.MSG.DeleteLibraryIRResponse));
       }
       else if (type === MSG.SetCaptureSlotContentRequest) reply(buildFrame([0x18, 0x01], MSG.SetCaptureSlotContentResponse));
       else if (type === MSG.SetCabinetSlotContentRequest) reply(buildFrame([0x18, 0x01], MSG.SetCabinetSlotContentResponse));
@@ -4191,16 +5994,40 @@
       } else if (type === MSG.TunerMode) {
         const f = framePayloadFields(bytes);
         tunerDemo(Boolean(f[4] && f[4][0] && f[4][0].value));
+      } else if (type === NanoTransfer.MSG_PREVIEW_CAPTURE) {
+        previewReply(Array.from(bytes.slice(2, bytes.length - 4)));
+      } else if (type === NanoTransfer.MSG_DOWNLOAD_IR) {
+        irDownloadReply(Array.from(bytes.slice(2, bytes.length - 4)));
+      } else if (type === NanoTransfer.MSG_PREVIEW_STOP) {
+        // 148 { 2: transaction, 3 or 4: 0 } → 149 { 1: 1, 2: transaction, 3: 1 }. Test hook: answer a refusal (status 0).
+        // Test hook: hooks.stopDelay (ms) answers that much later (a slow pedal).
+        const f = framePayloadFields(bytes);
+        const tx = f[2] && f[2][0] ? f[2][0].value : 0;
+        const refused = !!hooks.refuseStop;
+        if (!refused && f[3]) audition.capture = '';   // field 3: the capture audition stopped
+        const answer = () => notify(buildFrame([0x08, 0x01, 0x10, ...varint(tx), 0x18, refused ? 0x00 : 0x01], NanoTransfer.MSG_PREVIEW_STOP_REPLY));
+        if (hooks.stopDelay) setTimeout(answer, hooks.stopDelay); else answer();
+      } else if (type === MSG_IR_PREVIEW) {
+        // 158 { 3 or 4: { 1: index, 2: name }, 8: 1 } → 159 { 1: 6, 3: 1, 4: { 2: name } } when the item exists.
+        const f = framePayloadFields(bytes);
+        const rec = f[3] ? f[3][0] : f[4] ? f[4][0] : null;
+        const r = rec ? parseProtoFields(rec.raw) : {};
+        const list = f[3] ? LIB.irFactory : LIB.irUser;
+        const name = textField(r, 2);
+        const ok = list.some(x => x.index === (r[1] ? r[1][0].value : 0) && sameName(x.name, name));
+        const enc = Array.from(new TextEncoder().encode(name));
+        notify(buildFrame([0x08, 0x06, 0x18, ok ? 0x01 : 0x00, 0x22, enc.length + 2, 0x12, enc.length, ...enc], MSG_IR_PREVIEW_REPLY));
       } else if (type === DEV_MSG.ALIVE_REQ || type === DEV_MSG.INFO_REQ || type === DEV_MSG.SETTINGS_REQ || type === DEV_MSG.SET || type === DEV_MSG.CAPTURE_REQ) {
         notify(deviceReply(type, framePayloadFields(bytes)));
       }
     }
 
     // Device page and capture info, answered the way the pedal did in the 2026-10-09 trace.
-    const devStore = { brightness: 153, usbDb: -6 };
+    const devStore = { brightness: 153, usbDb: -6, muteInput: false, muteOutput: false };
     const pbStr = (field, text) => { const b = Array.from(new TextEncoder().encode(text)); return [(field << 3) | 2, ...varint(b.length), ...b]; };
     const pbSub = (field, b) => [(field << 3) | 2, ...varint(b.length), ...b];
     const fakeHash = (seed, n) => Array.from({ length: n }, (_, k) => ((seed * 31 + k * 7 + 3) % 16).toString(16)).join('');
+    const DEMO_CLOUD_ID = '5D3E0C10-0D00-4A11-8C55-0000000000A5';
     const DEMO_TAGS = { 1: ['Marshall', 'Jubilee', 'Crunch'], 2: ['EVH', '5150', 'High gain'], 3: ['Mesa', 'JP2C', 'Lead'], 4: ['Fender', 'Princeton', 'Clean'] };
     function deviceReply(type, f) {
       const int = (n) => (f[n] && f[n][0] && f[n][0].wire === 0 ? f[n][0].value : 0);
@@ -4213,11 +6040,15 @@
       if (type === DEV_MSG.SET) {
         if (f[4]) devStore.brightness = int(4);
         if (f[14] && f[14][0].wire === 5) devStore.usbDb = new DataView(Uint8Array.from(f[14][0].raw).buffer).getFloat32(0, true);
+        if (f[12]) devStore.muteInput = int(12) !== 0;
+        if (f[13]) devStore.muteOutput = int(13) !== 0;
         return longFrame([0x08, 0x01, 0x18, 0x01], DEV_MSG.SET_ACK);
       }
       if (type === DEV_MSG.SETTINGS_REQ) {
         return longFrame([0x08, 0x01, 0x18, 0x01, ...pbStr(5, 'Neural DSP Nano Cortex'), 0x30, ...varint(devStore.brightness), 0x38, 0x01, 0x40, 0x01,
-          0x58, 0x00, 0x60, 0x01, 0x68, 0x81, 0x01, 0x70, 0x01, 0x8D, 0x01, ...float32LE(devStore.usbDb)], DEV_MSG.SETTINGS);
+          0x58, 0x00, 0x60, 0x01, 0x68, 0x81, 0x01, 0x70, 0x01,
+          ...(devStore.muteInput ? [0x78, 0x01] : []), ...(devStore.muteOutput ? [0x80, 0x01] : []),
+          0x8D, 0x01, ...float32LE(devStore.usbDb)], DEV_MSG.SETTINGS);
       }
       // 17 → 18: the slot's capture, with the library's author and kind when the library has it by name.
       const slot = int(3) + 1;
@@ -4232,9 +6063,17 @@
       const by = [...pbStr(1, author), ...pbStr(2, author)];
       const record = [...pbStr(1, hash), ...pbStr(2, name), ...pbSub(4, by), ...pbStr(6, kind), ...tags.flatMap(t => pbStr(7, t)), 0x40, 0x04,
         ...pbStr(10, instrument), 0x58, 0x01, ...pbStr(12, '1')];
-      return longFrame([0x08, 0x06, 0x18, 0x01, ...pbSub(7, by), ...pbStr(8, 'Demo capture in slot ' + slot + '.'), ...pbStr(9, hash), ...pbStr(10, name),
+      // No description: slot 4 answers an empty one (like the traced reply), slot 2 the text "null". Slot 5's description
+      // is just a Cortex Cloud ID (made up; capitals, to show it is matched in any case), as some captures on a real
+      // pedal have. (Slot 3 keeps one: docs/images/capture-info.png shows it.)
+      const desc = slot === 2 ? 'null' : slot === 4 ? '' : slot === 5 ? DEMO_CLOUD_ID : 'Demo capture in slot ' + slot + '.';
+      return longFrame([0x08, 0x06, 0x18, 0x01, ...pbSub(7, by), ...pbStr(8, desc), ...pbStr(9, hash), ...pbStr(10, name),
         ...pbSub(11, record)], DEV_MSG.CAPTURE);
     }
+    window.__devDemo = {
+      store: devStore,
+      emitSettings: () => window.handleTypedMessage(deviceReply(DEV_MSG.SETTINGS_REQ, {})),
+    };
     let tunerTimer = null;
     function tunerDemo(on) {
       clearInterval(tunerTimer); tunerTimer = null;
@@ -4320,7 +6159,8 @@
     }
     function load(n) {
       if (!running) return;
-      if (saved.has(n)) applySnapshot(saved.get(n)); else if (n <= 24) fromPreset(n); else blank();
+      audition.capture = ''; audition.presetCapture = null;
+      if (saved.has(n)) applySnapshot(saved.get(n)); else if (origin[n - 1] <= 24) fromPreset(origin[n - 1]); else blank();
       reportFxModels();
       applyStateDump();
       emitTempo();
@@ -4343,7 +6183,8 @@
       for (let i = 1; i <= 64; i++) state.presetNames.set(i, i <= 24 ? PRESETS[(i - 1) % PRESETS.length].name + (i > 10 ? ' ' + Math.ceil(i / 10) : '') : 'Empty');
       CAPTURES.forEach((c, i) => state.captureNames.set(i + 1, c));
       IRS.forEach((_, i) => state.irNames.set(i + 1, IR_NAME(i + 1)));
-      state.c304 = { writeValueWithResponse: async (bytes) => onWrite(bytes) };
+      // Test hook: hooks.writeDelay (ms) keeps each write in flight that long.
+      state.c304 = { writeValueWithResponse: async (bytes) => { onWrite(bytes); if (hooks.writeDelay) await new Promise(r => setTimeout(r, hooks.writeDelay)); } };
       state.firmware = DEMO_FW;
       origWait = window.waitForPresetState;
       window.waitForPresetState = async () => true; // no state read-back without a pedal
@@ -4365,6 +6206,7 @@
     function stop() {
       running = false;
       ui.demo = false;
+      audition.capture = ''; audition.presetCapture = null;
       state.c304 = null; state.connected = false;
       if (origWait) window.waitForPresetState = origWait;
       tunerDemo(false);
@@ -4379,7 +6221,7 @@
     }
     const store = (n) => { saved.set(n, snapshot()); expSaved.set(n, expOf(state.selectedPreset)); expLive.delete(n); };
     const erase = (n) => { saved.delete(n); expSaved.delete(n); expLive.delete(n); state.presetNames.set(n, 'Empty'); };
-    return { start, stop, load, store, erase, pickCapture, pickIR, stateDump, get running() { return running; }, get tempo() { return { buf: tempoBuf, run: tempoRun }; } };
+    return { start, stop, load, store, erase, pickCapture, pickIR, stateDump, hooks, get running() { return running; }, get tempo() { return { buf: tempoBuf, run: tempoRun }; } };
   })();
   window.__demo = demo;
 
@@ -4392,9 +6234,38 @@
   if (devTools && pref.get('drawerAtLaunch', false)) toggleDrawer();
   if (shellBridge) shellBridge.setAccent(pref.get('accent', ACCENTS[0].hex), pref.get('dockFollowsAccent', true)).catch(() => {});
   if (shellBridge && shellBridge.setDevTools) shellBridge.setDevTools(devTools).catch(() => {});   // the menu follows the page's setting
+  // A freshly (re)loaded editor runs no preview: tell the Cloud toolbar, which may still show Stop Preview.
+  pushPreviewState();
+  // Outermost notification handler (installed last; connectAll() attaches whatever window.onC305 is): every layer
+  // below, upstream's included, gets a value whose buffer holds exactly the notification.
+  window.onC305 = NanoLive.withExactBytes(window.onC305);
   const startDemo = !navigator.bluetooth || window.__FORCE_DEMO || /[?&]demo\b/.test(location.search);
   // Reconnect at launch: the shell grants the user gesture requestDevice() needs and picks the remembered pedal.
-  window.__autoConnect = () => { window.__autoConnect = null; return doConnect(); };
+  window.__autoConnect = () => { window.__autoConnect = null; ble.autoWhy = 'launch'; ble.next = { auto: true }; return doConnect(); };
+  // Sleep and wake (src/main.js, powerMonitor): before the computer sleeps the page disconnects cleanly, so no link is
+  // left for macOS to hold; on wake it reconnects the remembered pedal the way the launch reconnect does (an auto scan)
+  // whenever it was connected before the sleep. That is not the "Reconnect … at launch" setting, which stays launch-only
+  // (the native edition reconnects after any dropped link, wake included). main runs __systemResume with a user gesture
+  // (requestDevice() needs one) and says whether a pedal is remembered (the auto scan takes only that one).
+  window.__systemSuspend = () => {
+    ble.wakeReconnect = false;
+    if (ui.demo || !state.connected) return false;
+    ble.wakeReconnect = true;
+    log('The computer is going to sleep: disconnecting from the pedal.');
+    disconnect();
+    return true;
+  };
+  window.__systemResume = (opts = {}) => {
+    const was = ble.wakeReconnect;
+    ble.wakeReconnect = false;
+    if (!was || ui.demo || state.connected || ui.connecting) return false;
+    if (!(opts && opts.pedal)) { log('The computer woke up. Click Connect to reconnect to the pedal.'); return false; }
+    log('The computer woke up: reconnecting to the remembered pedal.');
+    ble.autoWhy = 'wake';
+    ble.next = { auto: true };
+    doConnect();
+    return true;
+  };
   if (startDemo) demo.start();
   else if (shellBridge && pref.get('autoConnect', false)) shellBridge.autoConnect().catch(() => {});
 })();

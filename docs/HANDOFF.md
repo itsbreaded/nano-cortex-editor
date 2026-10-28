@@ -80,7 +80,8 @@ Produces the ground truth every later step is tested against. Back up presets in
   refresh → optional slot load. Verified on the pedal 2026-10-08: "Klon Centaur 1" (10 350 B) went over in 22 writes,
   the pedal answered type 14 with the cloud's hash, and the library listed it as user capture 2
   (recorded session, not published).
-- IRs from Cortex Cloud: same route presumably (`/api/v1/user/products/impulse_response` exists). Not traced yet.
+- IRs from Cortex Cloud: implemented from the 2026-10-15 trace and authenticated page inspection (Investigation section 6a). The Cloud profile's Impulse Responses list receives per-row **Send to Nano** buttons; each downloads raw WAV data, sends type 15, waits for type 16, then refreshes type 76/77 so “IRs on pedal” updates. End-to-end pedal verification is still needed.
+- Delete a user IR from the pedal: implemented from the decoded type 82/83 exchange (Investigation §6a), with type 76/77 refresh and a right-click **Delete…** action in the IR library list. Hardware verification is still needed; capture deletion remains undecoded.
 
 ## 4b. Queue after the first release (in suggested order)
 
@@ -91,7 +92,7 @@ Produces the ground truth every later step is tested against. Back up presets in
    scans all presets; upstream has `scanSlotUsage`, currently dropped by build-core). Needs a progress UI.
 4. **Connect polish** (Opus): keep scanning while the connect card is open instead of giving up after 5 s;
    reconnect automatically after a drop; remember the last pedal.
-5. IRs from Cortex Cloud (Fable, one more trace), cab-from-library tone knobs, preset reorder/copy.
+5. Cab-from-library tone knobs, preset reorder/copy; verify the new Cloud IR send flow on hardware.
 5b. Parity with the official app's upload (Sonnet): send `3.2 = hex MD5 of the .cns bytes` in the type-13 message
    (found while porting to Swift; the pedal accepts uploads without it). Add to `pro/transfer.js` + a test.
 5c. **Library-referenced captures/cabs** (Opus, done in PR #19): the state dump reports capture position 6 / cab slot 6 (one past
@@ -128,6 +129,7 @@ Produces the ground truth every later step is tested against. Back up presets in
 5p. **Preset tempo + metronome sync** (Fable, done in PR on `feature/preset-tempo`; mirrors native row 25, decoded in `INVESTIGATION.md` §9): Tempo field in every inspector's title row (TEMPO label scrubs sideways, − number +, BPM, Tap); −/+/scrub go live (type 145 `3:1`) and commit (`3:0`, dirty) 0.8 s after they settle, Tap 2.6 s, Enter at once, Save flushes a pending commit; shows state-dump field 56 and pedal-side changes (rx 145, not written back). Settings → Metronome → "Follow the preset tempo" (off by default): the metronome plays the preset tempo, its changes go live and commit after 1.5 s, trainer steps live only. Not yet tried on the pedal.
 5q. **Expression pedal assignments** (Fable, done in PR on `feature/expression-assignments`): EXP pill ahead of In (count badge, `E`) opens the panel in the inspector; per-preset set read with 60 on every preset load/connect, whole set written with one 62 per edit (sweeps Heel/Toe/Invert, switches Heel-toe/Switch/Stop + Delay/Latch/Invert), dirty → Save; bytes match the phone-app trace (INVESTIGATION §10); parity with the native panel. **Not yet tried on the pedal**: whether Save persists the set, and any target the trace didn't exercise.
 5r. **Device page and capture info** (Fable, done in PR on `feature/device-page`, not yet tried on the pedal): Settings gets General / Device tabs; Device reads 65 + 46 + 91 when it opens (About: name, firmware, serial, hash; LED brightness 0–255 as %, USB playback −20…0 dB, one 67 write carrying both, coalesced, nothing sent before a 66 read; Raw settings read-only); "Info…" on the capture node and capture slots sends 17 and shows a popover (author, kind icons, tag chips, description, hash + Copy), greyed out for a library-referenced capture. Protocol in INVESTIGATION §11.
+5s. **From #14 by @itsbreaded** (integrated on `feature/pr14-integration`): live pedal sync (`pro/live-sync.js`), Cloud IR send, capture / IR audition with the stop gate, IR delete, preset drag-reorder, monitoring mutes and the header Mute (INVESTIGATION §12). **Hardware verification pending** (checklist in the PR); port to the native app (parity).
 6. Sharing prep, only if wanted: Windows build (`.ico`, test Web Bluetooth there), notarised Mac build (paid Apple
    Developer), user-facing README, and a decision on the "keep private" rule in CLAUDE.md.
 

@@ -97,6 +97,8 @@ async function toolbarShots() {
 
 async function run() {
   await sleep(800); await hideToast();
+  // The real pointer may sit over the new window (a hovered preset row in the first shot); park the page's own at an empty spot.
+  wc.sendInputEvent({ type: 'mouseMove', x: 600, y: 760 }); await sleep(100); await frame();
   await shot('_editor-full');
   await shot('header', '.head', 0);
   await shot('sidebar', '.side', 0);
@@ -113,7 +115,10 @@ async function run() {
 
   // stages
   await key('1'); await shot('inspector-gate', '#inspector', 0);
-  await key('5'); await shot('inspector-cab', '#inspector', 0);
+  // Cab / IR: wait for the pedal library ("From the library" reads "Reading the pedal library…" until it arrives).
+  await key('5');
+  await js('requestLibraryContent(); new Promise(r => { const t0 = Date.now(); const f = () => (state.library.loaded || Date.now() - t0 > 6000) ? r() : setTimeout(f, 100); f(); })'); await sleep(300);
+  await shot('inspector-cab', '#inspector', 0);
   await click('[data-stage="post2"] .model'); await shot('inspector-fx', '#inspector', 0);
   await key('m'); await sleep(100);
   await shot('effect-picker', ['.pop', '[data-stage="post2"]'], 12);

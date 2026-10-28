@@ -1,9 +1,9 @@
 {
   "name": "nano-cortex-editor",
   "productName": "Nano Cortex Editor",
-  "version": "1.0.0",
+  "version": "1.2.1",
   "private": true,
-  "description": "Unofficial desktop editor for the Neural DSP Nano Cortex (macOS, Windows and Linux): presets, every block, captures, footswitches, expression, tempo, tuner, metronome and Cortex Cloud capture transfer over Bluetooth.",
+  "description": "Unofficial desktop editor for the Neural DSP Nano Cortex (macOS, Windows and Linux): presets, every block, captures, footswitches, expression, tempo, tuner, metronome and Cortex Cloud capture/IR transfer over Bluetooth.",
   "main": "src/main.js",
   "license": "MIT",
   "author": "AJs Creations",
@@ -74,6 +74,16 @@
       "icon": "build/icon.icns"
     },
     "copyright": "Copyright © 2026 AJs Creations. Unofficial; not affiliated with or endorsed by Neural DSP.",
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "AJs-Creations",
+        "repo": "nano-cortex-editor"
+      }
+    ],
+    "dmg": {
+      "writeUpdateInfo": false
+    },
     "artifactName": "nano-cortex-editor-${version}-${os}-${arch}.${ext}",
     "win": {
       "icon": "build/icon.png",
@@ -134,5 +144,8 @@
     "deb": {
       "artifactName": "nano-cortex-editor_${version}_${arch}.${ext}"
     }
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.10"
   }
 }
