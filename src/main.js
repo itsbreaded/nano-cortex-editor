@@ -25,6 +25,10 @@ const { refuseBrowserRequest, devShotPath } = require('./dev-remote');
 const CAPTURE_PAGE = /\/neural-capture\/view\/([0-9a-f-]{36})/i;
 const CLOUD_IR_PAGE = /^\/cloud\/profile\/impulses\/?$/i;
 const CLOUD_PRODUCT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const CLOUD_API_CLIENT_HEADERS = Object.freeze({
+  'X-Cloud-Api-Client-Type': 'web-cloud',
+  'X-Cloud-Api-Client-Version': '1.0.0'
+});
 
 const CLOUD_URL = 'https://cloud.neuraldsp.com/cloud/';
 const CLOUD_PARTITION = 'persist:cortex-cloud';
@@ -589,7 +593,9 @@ function untar(buf) {
 }
 
 async function fetchCaptureBundle(id) {
-  const res = await cloud.webContents.session.fetch('https://cloud-api.neuraldsp.com/api/v1/products/' + id + '/download', { credentials: 'include' });
+  const res = await cloud.webContents.session.fetch('https://cloud-api.neuraldsp.com/api/v1/products/' + id + '/download', {
+    credentials: 'include', headers: CLOUD_API_CLIENT_HEADERS
+  });
   if (!res.ok) throw new Error('Cortex Cloud answered ' + res.status + (res.status === 401 ? ' (not signed in?)' : ''));
   const json = await res.json();
   if (!json.payload) throw new Error('The reply has no capture payload.');
@@ -633,7 +639,7 @@ async function fetchCloudIRBundle(productId, listedName) {
   if (!CLOUD_PRODUCT_ID.test(String(productId || ''))) throw new Error('This Cloud IR has an invalid product ID.');
   const res = await cloud.webContents.session.fetch(
     'https://cloud-api.neuraldsp.com/api/v1/products/' + productId + '/download',
-    { credentials: 'include' }
+    { credentials: 'include', headers: CLOUD_API_CLIENT_HEADERS }
   );
   if (!res.ok) throw new Error('Cortex Cloud answered ' + res.status + (res.status === 401 ? ' (sign in to Cortex Cloud first)' : ''));
   let json;
